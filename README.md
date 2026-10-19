@@ -6,41 +6,47 @@ macOS Spaces.
 - `Option+1..9` switches the focused display to its Nth native Space.
 - `Option+Shift+1..9` moves the focused window to Space N of its display.
 - The app tiles the windows of each normal Space in an i3-style split tree.
+- Floating windows stay floating. Settings panels, dialogs, and windows
+  without a zoom button keep their own size and position.
 
 The app uses real Spaces. It does not emulate workspaces (AeroSpace does).
 It keeps SIP on. It loads private SkyLight functions with `dlsym`. Each
 private function is optional: a missing function disables one feature only.
 
-Requirements: macOS 14 or later (tested on macOS 26.1), Xcode 16 or later.
+Requirements: macOS 14 or later (tested on macOS 26.1). To build from source: Xcode 16 or later.
 
 ## Install
 
-1. Quit AeroSpace. SimpleWM does not tile while `bobko.aerospace` runs.
-   Both apps also use the same `Option` chords.
-2. Build the app bundle:
+### From a release (no build)
 
-   ```sh
-   scripts/make-app.sh
-   ```
-
-3. Open the app:
-
-   ```sh
-   open dist/SimpleWM.app
-   ```
-
-4. Grant Accessibility. Open System Settings > Privacy & Security >
-   Accessibility. Turn on SimpleWM. The app checks the grant every 2 s and
-   starts by itself.
+1. Download `SimpleWM-<version>.zip` from the
+   [Releases page](https://github.com/pedr0v/SimpleWM/releases).
+2. Unzip it and move `SimpleWM.app` to `/Applications`.
+3. Quit AeroSpace. SimpleWM does not tile while `bobko.aerospace` runs. Both
+   apps use the same `Option` chords.
+4. Open SimpleWM. macOS asks for Accessibility. Click "Open System
+   Settings" and turn on SimpleWM. The app checks the grant every 2 s and
+   starts itself.
 5. Optional: open System Settings > Desktop & Dock. Turn on "Displays have
    separate Spaces". Without it, the app tiles only the focused display.
 
-The default build uses an ad-hoc signature. Each rebuild changes the
-signature, and macOS drops the Accessibility grant. To keep the grant, set
-`SIMPLEWM_SIGN_IDENTITY` to a stable codesign identity:
+The release is signed with a Developer ID and notarized. The Accessibility
+grant survives updates.
+
+### From source
 
 ```sh
-SIMPLEWM_SIGN_IDENTITY="SimpleWM Dev" scripts/make-app.sh
+scripts/make-app.sh
+open dist/SimpleWM.app
+```
+
+The script signs with the first "Developer ID Application" identity in your
+keychain. Without one it uses an ad-hoc signature. An ad-hoc signature
+changes on each build, so macOS drops the Accessibility grant. To use
+another identity:
+
+```sh
+SIMPLEWM_SIGN_IDENTITY="Developer ID Application: Name (TEAMID)" scripts/make-app.sh
 ```
 
 If the grant stops working after a rebuild, reset it and add the app again:
