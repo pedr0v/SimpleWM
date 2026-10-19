@@ -6,6 +6,9 @@ final class LayoutEngineTests: XCTestCase {
         XCTAssertEqual(Command.parse("focus left"), .focus(.left))
         XCTAssertEqual(Command.parse("move-to-space 3"), .moveToSpace(3))
         XCTAssertEqual(Command.parse("resize -0.05"), .resize(-0.05))
+        XCTAssertEqual(Command.parse("toggle-float"), .toggleFloat)
+        XCTAssertEqual(Command.parse("float"), .toggleFloat)
+        XCTAssertNil(Command.parse("toggle-float x"))
         XCTAssertNil(Command.parse("space 0"))
         XCTAssertNil(Command.parse("bogus"))
     }

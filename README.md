@@ -75,6 +75,7 @@ warning is active, the first menu row shows the reason.
 | `alt-r` | `balance` | Give equal sizes to all windows. |
 | `alt-shift-minus` | `resize -0.05` | Make the window smaller. |
 | `alt-shift-equal` | `resize 0.05` | Make the window larger. |
+| `alt-shift-space` | `toggle-float` | Toggle the focused window between tiled and floating. |
 
 `N` counts only normal Spaces of the display. Fullscreen app Spaces do not
 count. The app never creates a Space. If Space N does not exist, the key
@@ -106,6 +107,7 @@ Config" to apply it.
   "floatingApps" : [
     "com.apple.systempreferences"
   ],
+  "floatWindowsWithoutZoom" : true,
   "followOnMove" : false,
   "gaps" : {
     "inner" : 8,
@@ -128,8 +130,11 @@ Keys:
     `space`, `return`, `tab`, `escape`.
   - Commands: `focus D`, `move D`, `space N`, `move-to-space N`,
     `fullscreen`, `toggle-split`, `split horizontal|vertical`, `balance`,
-    `resize X`.
+    `resize X`, `toggle-float`.
 - `floatingApps`: bundle IDs that the app never tiles.
+- `floatWindowsWithoutZoom`: when `true` (default), a window without an
+  enabled zoom button floats. System Settings and most utility panels have
+  no zoom button, so they keep their own size and position.
 - `followOnMove`: when `true`, `move-to-space N` also switches to Space N.
 - `gaps.inner`: points between windows. `gaps.outer`: points at the screen edge.
 - `rootOrientation`: `auto` (longer side of the screen), `horizontal`, or `vertical`.
@@ -153,6 +158,19 @@ good config, and the app logs the error. A bad binding is logged and skipped.
 - macOS lists windows only on visible Spaces. The app updates a tree only
   while its Space is visible.
 - A window set to "All Desktops" floats. The app does not tile it.
+
+## Floating windows
+
+A floating window keeps its own frame. The app never resizes or moves it.
+A window floats when one of these holds:
+
+- Its app is in `floatingApps`.
+- Its subrole is not `AXStandardWindow` (dialogs, sheets, panels).
+- AX cannot set its position or size.
+- It has no enabled zoom button and `floatWindowsWithoutZoom` is `true`.
+- You pressed `alt-shift-space` on it. Press again to tile it.
+
+The toggle is per window and lasts until the window closes.
 - `move-to-space N` does nothing for a native fullscreen window.
 - After a screen change (plug, unplug, wake), the app waits 1 s before it
   tiles again. macOS moves windows in that time.

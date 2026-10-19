@@ -126,7 +126,11 @@ does not break it. With `followOnMove` the app switches after the move.
 
 Tileable: subrole `AXStandardWindow`, not minimized, `AXFullScreen` false,
 position and size settable, on screen at layer 0, bundle ID not in
-`floatingApps`, not our pid.
+`floatingApps`, not our pid, has an enabled zoom button (when
+`floatWindowsWithoutZoom` is true), not in the `toggle-float` set.
+The `toggle-float` command (`alt-shift-space`) adds or removes the focused
+window from that set and removes it from its tree. The set drops a window
+on `windowDestroyed`.
 
 ## Bindings (default)
 

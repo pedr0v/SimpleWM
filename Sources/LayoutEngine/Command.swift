@@ -22,6 +22,8 @@ public enum Command: Equatable, Sendable {
     case split(Orientation)
     case balance
     case resize(Double)
+    /// Toggles the focused window between tiled and floating.
+    case toggleFloat
 
     /// Parses the text form. Returns nil for unknown text. Parsing is case-insensitive.
     public static func parse(_ text: String) -> Command? {
@@ -45,6 +47,8 @@ public enum Command: Equatable, Sendable {
             return Orientation(rawValue: o).map(Command.split)
         case ("balance", nil):
             return .balance
+        case ("toggle-float", nil), ("float", nil):
+            return .toggleFloat
         case ("resize", let d?):
             return Double(d).map(Command.resize)
         default:

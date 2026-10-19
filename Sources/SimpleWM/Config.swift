@@ -20,11 +20,14 @@ public struct Config: Codable, Equatable {
     public var followOnMove: Bool = false
     public var spaceSwitch: SpaceSwitch = SpaceSwitch()
     public var floatingApps: [String] = ["com.apple.systempreferences"]
+    /// When true, a window without a usable zoom button floats. Settings
+    /// panels and utility windows have no zoom button.
+    public var floatWindowsWithoutZoom: Bool = true
     /// Key chord text to command text. See `KeyChord` and `Command.parse`.
     public var bindings: [String: String] = Config.defaultBindings
 
     enum CodingKeys: String, CodingKey {
-        case gaps, rootOrientation, followOnMove, spaceSwitch, floatingApps, bindings
+        case gaps, rootOrientation, followOnMove, spaceSwitch, floatingApps, floatWindowsWithoutZoom, bindings
     }
 
     public static let defaultBindings: [String: String] = {
@@ -33,6 +36,7 @@ public struct Config: Codable, Equatable {
             "alt-shift-h": "move left", "alt-shift-j": "move down", "alt-shift-k": "move up", "alt-shift-l": "move right",
             "alt-f": "fullscreen", "alt-e": "toggle-split", "alt-r": "balance",
             "alt-shift-minus": "resize -0.05", "alt-shift-equal": "resize 0.05",
+            "alt-shift-space": "toggle-float",
         ]
         for n in 1...9 {
             b["alt-\(n)"] = "space \(n)"
@@ -119,6 +123,7 @@ extension Config {
             spaceSwitch = s
         }
         floatingApps = try c.decodeIfPresent([String].self, forKey: .floatingApps) ?? floatingApps
+        floatWindowsWithoutZoom = try c.decodeIfPresent(Bool.self, forKey: .floatWindowsWithoutZoom) ?? floatWindowsWithoutZoom
         bindings = try c.decodeIfPresent([String: String].self, forKey: .bindings) ?? bindings
     }
 }

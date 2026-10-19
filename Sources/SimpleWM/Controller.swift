@@ -113,12 +113,14 @@ public final class WMController {
         case "ctrl-n": switches = [ctrlN]
         default: switches = [gesture, ctrlN]
         }
+        let enumerator = WindowEnumerator(floatingBundleIDs: Set(config.floatingApps))
+        enumerator.floatWindowsWithoutZoom = config.floatWindowsWithoutZoom
         return WMController(config: config,
                      spaceManager: SpaceManager(
                         switchStrategies: switches,
                         moveStrategies: [BridgedMove(), CompatIDMove(), ManagedSpaceMove()]),
                      displayManager: DisplayManager(),
-                     enumerator: WindowEnumerator(floatingBundleIDs: Set(config.floatingApps)),
+                     enumerator: enumerator,
                      observer: WindowObserver(),
                      hotkeys: HotkeyManager())
     }
@@ -223,6 +225,7 @@ public final class WMController {
         }
         config = next
         enumerator.floatingBundleIDs = Set(next.floatingApps)
+        enumerator.floatWindowsWithoutZoom = next.floatWindowsWithoutZoom
         for case let gesture as GestureSwitch in spaceManager.switchStrategies {
             gesture.warpCursor = next.spaceSwitch.warpCursor
         }
@@ -464,6 +467,8 @@ public final class WMController {
             }
         case .appLaunched, .appTerminated:
             updateAeroSpaceState(notify: true)
+        case .windowDestroyed(let id):
+            if let id { enumerator.floatingWindowIDs.remove(id) }
         case .windowMoved(let id), .windowResized(let id):
             // Our own frame write causes these events. A refresh for them
             // would write the same frame again.
@@ -546,7 +551,28 @@ public final class WMController {
             mutateFocusedTree { $0.balance() }
         case .resize(let delta):
             mutateFocusedTree { $0.resize(delta: delta) }
+        case .toggleFloat:
+            toggleFloat()
         }
+    }
+
+    /// Toggles the focused window between tiled and floating. A floating
+    /// window keeps its frame and leaves the tree. The next refresh fills
+    /// the gap. A window that tiles again joins the tree next to the focused
+    /// leaf.
+    private func toggleFloat() {
+        guard tilingActive, let w = enumerator.focusedWindow() else { return }
+        if enumerator.floatingWindowIDs.contains(w.id) {
+            enumerator.floatingWindowIDs.remove(w.id)
+            log.info("Window \(w.id, privacy: .public) tiles again.")
+        } else {
+            enumerator.floatingWindowIDs.insert(w.id)
+            if let key = state.key(of: w.id) {
+                state.update(key) { $0.remove(w.id) }
+            }
+            log.info("Window \(w.id, privacy: .public) floats.")
+        }
+        refresh()
     }
 
     private func gotoSpace(_ n: Int) {

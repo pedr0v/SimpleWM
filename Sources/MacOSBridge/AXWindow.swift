@@ -82,7 +82,7 @@ public struct AXWindow {
     /// `AXFullScreen` false, position and size settable, on-screen at layer 0.
     /// Windows of this process never qualify.
     public var isTileable: Bool {
-        guard isTileableByAX else { return false }
+        guard tileabilityByAX(requireZoom: true) == .yes else { return false }
         return WindowEnumerator.isOnScreenLayerZero(id)
     }
 
@@ -94,10 +94,12 @@ public struct AXWindow {
 
     /// The AX part of `isTileable`. `WindowEnumerator` checks the
     /// on-screen part once for all windows.
-    var isTileableByAX: Bool { tileabilityByAX == .yes }
+    var isTileableByAX: Bool { tileabilityByAX(requireZoom: true) == .yes }
 
     /// Like `isTileableByAX`, but tells a timeout apart from a real no.
-    var tileabilityByAX: AXTileability {
+    /// With `requireZoom`, a window without an enabled zoom button is not
+    /// tileable. Settings panels and utility windows have no zoom button.
+    func tileabilityByAX(requireZoom: Bool) -> AXTileability {
         guard pid != getpid(), id.raw != 0 else { return .no }
         let role = AXHelper.read(element, kAXSubroleAttribute)
         if AXHelper.isTransient(role.status) { return .unknown }
@@ -112,7 +114,29 @@ public struct AXWindow {
             guard let settable = AXHelper.settable(element, attribute) else { return .unknown }
             if !settable { return .no }
         }
+        if requireZoom {
+            switch hasUsableZoomButton {
+            case .no: return .no
+            case .unknown: return .unknown
+            case .yes: break
+            }
+        }
         return .yes
+    }
+
+    /// Whether the window has a zoom button that is enabled.
+    /// `.attributeUnsupported` and a missing button both mean `.no`.
+    var hasUsableZoomButton: AXTileability {
+        let button = AXHelper.read(element, kAXZoomButtonAttribute)
+        if AXHelper.isTransient(button.status) { return .unknown }
+        guard button.status == .success, let value = button.value,
+              CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return .no }
+        let enabled = AXHelper.read(value as! AXUIElement, kAXEnabledAttribute)
+        if AXHelper.isTransient(enabled.status) { return .unknown }
+        // A button without the attribute counts as enabled.
+        guard enabled.status == .success else { return .yes }
+        return (enabled.value as? NSNumber)?.boolValue == false ? .no : .yes
     }
 
     public var isMinimized: Bool { AXHelper.bool(element, kAXMinimizedAttribute) ?? false }
@@ -234,6 +258,12 @@ public final class WindowEnumerator {
     /// Bundle IDs whose windows float (never tiled).
     public var floatingBundleIDs: Set<String>
 
+    /// Windows that the user toggled to floating with `toggle-float`.
+    public var floatingWindowIDs: Set<WindowID> = []
+
+    /// When true, a window without an enabled zoom button floats.
+    public var floatWindowsWithoutZoom: Bool = true
+
     private let log = Logger(subsystem: "com.simplewm.app", category: "windows")
 
     /// Windows that the last `tileableWindows()` call could not judge. They
@@ -283,9 +313,10 @@ public final class WindowEnumerator {
             }
             for element in AXHelper.elementList(list.value) {
                 guard let wid = AXHelper.windowID(element), onScreen.ids.contains(wid) else { continue }
+                if floatingWindowIDs.contains(wid) { continue }
                 AXUIElementSetMessagingTimeout(element, AXHelper.appTimeout)
                 let window = AXWindow(id: wid, pid: pid, element: element, bundleID: bundleID)
-                switch window.tileabilityByAX {
+                switch window.tileabilityByAX(requireZoom: floatWindowsWithoutZoom) {
                 case .yes: result.append(window)
                 case .no: break
                 case .unknown: uncertain.insert(wid)
