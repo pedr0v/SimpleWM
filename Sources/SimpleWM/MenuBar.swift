@@ -8,8 +8,8 @@ import AppKit
 /// - `sWM!`: a warning is active, or the Accessibility grant is missing.
 /// - `sWM·`: disabled.
 ///
-/// The update item shows "Verificar atualizações" by default. When the updater
-/// finds a new version V, it shows "Atualizar (vV)". The item stays hidden
+/// The update item shows "Check for Updates" by default. When the updater
+/// finds a new version V, it shows "Update (vV)". The item stays hidden
 /// until `onCheckForUpdates` is set.
 @MainActor
 public final class MenuBar: NSObject {
@@ -25,8 +25,8 @@ public final class MenuBar: NSObject {
     private let enabledMenuItem = NSMenuItem(title: "Enabled", action: nil, keyEquivalent: "")
     private let updateMenuItem = NSMenuItem(title: MenuBar.checkForUpdatesTitle, action: nil, keyEquivalent: "")
 
-    static let checkForUpdatesTitle = "Verificar atualizações"
-    static func updateTitle(version: String) -> String { "Atualizar (v\(version))" }
+    static let checkForUpdatesTitle = "Check for Updates"
+    static func updateTitle(version: String) -> String { "Update (v\(version))" }
 
     public override init() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -93,7 +93,7 @@ public final class MenuBar: NSObject {
         item.button?.toolTip = text.map { "SimpleWM: \($0)" } ?? "SimpleWM"
     }
 
-    /// Shows "Atualizar (vV)" for a new version V. Nil shows "Verificar atualizações".
+    /// Shows "Update (vV)" for a new version V. Nil shows "Check for Updates".
     public func setAvailableUpdate(version: String?) {
         if let version, !version.isEmpty {
             updateMenuItem.title = Self.updateTitle(version: version)

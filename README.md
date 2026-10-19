@@ -42,11 +42,11 @@ update without your permission.
 - The app reads the appcast of the latest GitHub release 10 s after it
   starts and then every 24 h. This check shows no window and downloads no
   release.
-- When a newer version exists, the menu item "Verificar atualizações"
-  changes to "Atualizar (vX.Y.Z)".
+- When a newer version exists, the menu item "Check for Updates"
+  changes to "Update (vX.Y.Z)".
 - Click the item. The Sparkle window shows the new version. Click "Install
   Update" to download and install it. Sparkle then relaunches the app.
-- "Verificar atualizações" checks now and shows the result in a window.
+- "Check for Updates" checks now and shows the result in a window.
 - "Skip This Version" hides that version until you check by hand.
 
 Sparkle checks the EdDSA signature of each update before it installs it.
@@ -86,7 +86,7 @@ The status item shows a split icon and a short title:
 Menu items: Enabled (toggle), Open Config, Reload Config, the update item,
 Quit. When a warning is active, the first menu row shows the reason.
 
-The update item shows "Verificar atualizações", or "Atualizar (vX.Y.Z)" when
+The update item shows "Check for Updates", or "Update (vX.Y.Z)" when
 a newer release exists (see Updates). A build that runs outside the app
 bundle (`.build/debug/SimpleWM`) has no update item.
 

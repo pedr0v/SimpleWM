@@ -9,7 +9,7 @@ import os
 /// 1. Write the default config when the file is absent. Load the config.
 /// 2. Build the controller and install the menu bar.
 /// 3. Start the updater. It probes for a new release 10 s later and every 24 h.
-///    The menu shows "Atualizar (vX.Y.Z)" when a release is newer.
+///    The menu shows "Update (vX.Y.Z)" when a release is newer.
 /// 4. Check the Accessibility grant. Without it, show the system prompt and
 ///    poll every 2 s. Start the controller when the grant arrives.
 @MainActor

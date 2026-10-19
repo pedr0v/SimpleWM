@@ -54,8 +54,8 @@ with `dlsym`.
   automatically" option.
 - A timer calls `checkForUpdateInformation` 10 s after the start and then
   every 24 h. This probe reads the appcast only. The delegate reports the
-  result: `didFindValidUpdate` sets the menu item to "Atualizar (vX.Y.Z)",
-  `updaterDidNotFindUpdate` sets it to "Verificar atualizações".
+  result: `didFindValidUpdate` sets the menu item to "Update (vX.Y.Z)",
+  `updaterDidNotFindUpdate` sets it to "Check for Updates".
 - A click on the menu item calls `checkForUpdates`. The Sparkle window opens.
   The download and the install start only after "Install Update".
 - "Skip This Version" resets the menu item. Probes do not report a skipped

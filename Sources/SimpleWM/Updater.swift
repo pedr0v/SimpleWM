@@ -11,7 +11,7 @@ import os
 ///   every 24 h. A probe reads the appcast only. It shows no UI and downloads
 ///   no release.
 /// - A probe reports the newest version through `onAvailableUpdate`.
-///   The menu then shows "Atualizar (vX.Y.Z)".
+///   The menu then shows "Update (vX.Y.Z)".
 /// - `checkForUpdates()` opens the Sparkle window. The user clicks
 ///   "Install Update" to download and install. This click is the permission.
 ///
