@@ -1,6 +1,9 @@
+import AppKit
 import Foundation
 import CoreGraphics
 import LayoutEngine
+import ObjectiveC
+import os
 
 /// One native Space as SkyLight reports it.
 public struct SpaceInfo: Equatable, Sendable {
@@ -59,6 +62,126 @@ public protocol WindowMoveStrategy: AnyObject {
     func move(_ w: WindowID, to target: SpaceID) async -> Bool
 }
 
+/// Result of the last `SpaceManager.switchTo(userSpace:on:)` call.
+///
+/// The controller reads it to tell a real failure from a normal no-op. Only
+/// `.failed` means that every strategy failed.
+public enum SpaceSwitchOutcome: Equatable, Sendable {
+    /// A strategy switched the display and verification passed.
+    case switched(strategy: String)
+    /// The target Space was already current. No event was posted.
+    case alreadyCurrent
+    /// N is less than 1 or greater than the user-Space count. Nothing ran.
+    case outOfRange
+    /// A newer request replaced this request before it ran.
+    case superseded
+    /// No strategy is available or no strategy verified.
+    case failed
+}
+
+// MARK: - Space reader
+
+/// Raw Space data of one display from `SLSCopyManagedDisplaySpaces`.
+struct RawDisplaySpaces {
+    /// `Display Identifier`: display UUID, or `Main` when displays share Spaces.
+    let identifier: String
+    let current: SpaceInfo?
+    let spaces: [SpaceInfo]
+}
+
+/// Reads Space state from SkyLight. Every function returns empty or nil
+/// when a symbol is absent.
+enum SpaceReader {
+    static let log = Logger(subsystem: "com.simplewm.app", category: "spaces")
+    /// Mask for `SLSCopySpacesForWindows`: current, other, and user Spaces.
+    static let allSpacesMask: Int32 = 0x7
+
+    /// Parses `SLSCopyManagedDisplaySpaces`. Order follows the SkyLight array.
+    static func rawDisplays(_ sl: SkyLight = .shared) -> [RawDisplaySpaces] {
+        guard let copy = sl.copyManagedDisplaySpaces,
+              let array = copy(sl.cid)?.takeRetainedValue() as? [[String: Any]]
+        else { return [] }
+        return array.compactMap { dict in
+            guard let identifier = dict["Display Identifier"] as? String else { return nil }
+            let current = (dict["Current Space"] as? [String: Any]).flatMap(spaceInfo)
+            let spaces = (dict["Spaces"] as? [[String: Any]] ?? []).compactMap(spaceInfo)
+            return RawDisplaySpaces(identifier: identifier, current: current, spaces: spaces)
+        }
+    }
+
+    /// Builds a `SpaceInfo` from one Space dictionary. `ManagedSpaceID` is
+    /// the ID; `id64` is the fallback.
+    static func spaceInfo(_ dict: [String: Any]) -> SpaceInfo? {
+        let raw = (dict["ManagedSpaceID"] as? NSNumber) ?? (dict["id64"] as? NSNumber)
+        guard let raw, raw.uint64Value != 0 else { return nil }
+        let type = (dict["type"] as? NSNumber)?.int32Value ?? 0
+        return SpaceInfo(id: SpaceID(raw.uint64Value), type: type)
+    }
+
+    /// Full Space list (fullscreen entries included) of one display.
+    static func spaces(ofDisplay id: DisplayID, _ sl: SkyLight = .shared) -> [SpaceInfo]? {
+        rawDisplays(sl).first { $0.identifier == id.uuid }?.spaces
+    }
+
+    /// `SLSManagedDisplayGetCurrentSpace`. Returns nil for zero or a missing symbol.
+    static func currentSpace(of display: DisplayID, _ sl: SkyLight = .shared) -> SpaceID? {
+        guard let fn = sl.managedDisplayGetCurrentSpace else { return nil }
+        let sid = fn(sl.cid, display.uuid as CFString)
+        return sid == 0 ? nil : SpaceID(sid)
+    }
+
+    /// `SLSManagedDisplayIsAnimating`. False when the symbol is absent.
+    static func isAnimating(_ display: DisplayID, _ sl: SkyLight = .shared) -> Bool {
+        guard let fn = sl.managedDisplayIsAnimating else { return false }
+        return fn(sl.cid, display.uuid as CFString)
+    }
+
+    /// `SLSCopySpacesForWindows` with mask 0x7 for one window.
+    static func spaces(ofWindow w: WindowID, _ sl: SkyLight = .shared) -> [SpaceID] {
+        guard let fn = sl.copySpacesForWindows else { return [] }
+        let list = [NSNumber(value: w.raw)] as CFArray
+        guard let result = fn(sl.cid, allSpacesMask, list)?.takeRetainedValue() as? [NSNumber] else {
+            return []
+        }
+        return result.map { SpaceID($0.uint64Value) }
+    }
+
+    /// Polls the current Space of `display` until it equals `target`.
+    /// Interval 30 ms. Returns false after `timeoutMs`.
+    @MainActor
+    static func waitForCurrentSpace(_ target: SpaceID, on display: DisplayID, timeoutMs: Int = 600) async -> Bool {
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+        while true {
+            if currentSpace(of: display) == target { return true }
+            if Date() >= deadline { return false }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+    }
+
+    /// Waits while SkyLight animates `display`. Interval 30 ms.
+    @MainActor
+    static func waitWhileAnimating(_ display: DisplayID, timeoutMs: Int = 600) async {
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+        while isAnimating(display), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+    }
+
+    /// Polls `SLSCopySpacesForWindows` until it lists `target`.
+    /// Interval 30 ms. Returns false after `timeoutMs`.
+    @MainActor
+    static func waitForWindow(_ w: WindowID, on target: SpaceID, timeoutMs: Int = 500) async -> Bool {
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+        while true {
+            if spaces(ofWindow: w).contains(target) { return true }
+            if Date() >= deadline { return false }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+    }
+}
+
+// MARK: - Space manager
+
 /// Reads Space state and runs switch and move strategies.
 ///
 /// Order of switch strategies: `GestureSwitch`, then `ControlKeySwitch`.
@@ -74,6 +197,17 @@ public final class SpaceManager {
     /// Called after a verified Space switch or move. Debounce before refresh.
     public var onSpaceChange: (() -> Void)?
 
+    /// Outcome of the last `switchTo(userSpace:on:)` call.
+    public private(set) var lastSwitchOutcome: SpaceSwitchOutcome?
+    /// Name of the switch strategy that verified last. The manager tries it first.
+    public private(set) var cachedSwitchStrategy: String?
+    /// Name of the move strategy that verified last. The manager tries it first.
+    public private(set) var cachedMoveStrategy: String?
+
+    private let log = Logger(subsystem: "com.simplewm.app", category: "spaces")
+    private var switchBusy = false
+    private var switchGeneration = 0
+
     public init(skyLight: SkyLight = .shared,
                 switchStrategies: [SpaceSwitchStrategy] = [],
                 moveStrategies: [WindowMoveStrategy] = []) {
@@ -83,41 +217,187 @@ public final class SpaceManager {
     }
 
     /// Reads `SLSCopyManagedDisplaySpaces` and builds one snapshot per display.
+    ///
+    /// Geometry comes from `NSScreen` (matched by display UUID). The identifier
+    /// `Main` (shared Spaces) maps to `NSScreen.main`. A display without
+    /// geometry is skipped.
     public func displays() -> [DisplaySnapshot] {
-        fatalError("TODO")
+        let raw = SpaceReader.rawDisplays(skyLight)
+        guard !raw.isEmpty else { return [] }
+        let infos = DisplayManager.currentDisplays()
+        var result: [DisplaySnapshot] = []
+        for entry in raw {
+            let info: DisplayInfo?
+            if entry.identifier == "Main" {
+                info = DisplayManager.mainDisplayInfo() ?? infos.first
+            } else {
+                info = infos.first { $0.id.uuid.caseInsensitiveCompare(entry.identifier) == .orderedSame }
+                    ?? DisplayManager.cgDisplayInfo(uuid: entry.identifier)
+            }
+            guard let info else {
+                log.debug("No geometry for display \(entry.identifier, privacy: .public)")
+                continue
+            }
+            let id = DisplayID(entry.identifier)
+            let liveCurrent = SpaceReader.currentSpace(of: id, skyLight)
+            let current: SpaceInfo
+            if let liveCurrent, let match = entry.spaces.first(where: { $0.id == liveCurrent }) {
+                current = match
+            } else if let c = entry.current {
+                current = entry.spaces.first { $0.id == c.id } ?? c
+            } else if let liveCurrent {
+                let type = skyLight.spaceGetType?(skyLight.cid, liveCurrent.raw) ?? 0
+                current = SpaceInfo(id: liveCurrent, type: type)
+            } else {
+                continue
+            }
+            result.append(DisplaySnapshot(id: id,
+                                          cgID: info.cgID,
+                                          frame: info.frame,
+                                          workArea: info.visibleFrame,
+                                          spaces: entry.spaces,
+                                          current: current))
+        }
+        return result
     }
 
     /// Current Space of `display` from `SLSManagedDisplayGetCurrentSpace`.
     public func currentSpace(of display: DisplayID) -> SpaceID? {
-        fatalError("TODO")
+        SpaceReader.currentSpace(of: display, skyLight)
     }
 
     /// Display that holds `w` (`SLSCopyManagedDisplayForWindow`).
     public func display(of w: WindowID) -> DisplayID? {
-        fatalError("TODO")
+        guard let fn = skyLight.copyManagedDisplayForWindow,
+              let s = fn(skyLight.cid, w.raw)?.takeRetainedValue() as String?,
+              !s.isEmpty
+        else { return nil }
+        return DisplayID(s)
     }
 
     /// Display with the active menu bar (`SLSCopyActiveMenuBarDisplayIdentifier`).
     public func activeMenuBarDisplay() -> DisplayID? {
-        fatalError("TODO")
+        guard let fn = skyLight.copyActiveMenuBarDisplayIdentifier,
+              let s = fn(skyLight.cid)?.takeRetainedValue() as String?,
+              !s.isEmpty
+        else { return nil }
+        return DisplayID(s)
     }
 
     /// Spaces that hold `w` (`SLSCopySpacesForWindows`, mask 0x7).
     public func spaces(of w: WindowID) -> [SpaceID] {
-        fatalError("TODO")
+        SpaceReader.spaces(ofWindow: w, skyLight)
     }
 
     /// Switches `display` to its Nth user Space (1-based). Does nothing when
     /// N exceeds the count. Never creates a Space.
+    ///
+    /// Returns true when the target Space is current after the call. A newer
+    /// request replaces an older request that still waits; the older request
+    /// returns false with outcome `.superseded`. Read `lastSwitchOutcome`
+    /// to tell a no-op from a failure.
     public func switchTo(userSpace n: Int, on display: DisplaySnapshot) async -> Bool {
-        fatalError("TODO")
+        switchGeneration += 1
+        let generation = switchGeneration
+        while switchBusy {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            if generation != switchGeneration {
+                log.debug("Switch to Space \(n) superseded")
+                lastSwitchOutcome = .superseded
+                return false
+            }
+        }
+        switchBusy = true
+        defer { switchBusy = false }
+
+        let outcome = await performSwitch(userSpace: n, on: display)
+        lastSwitchOutcome = outcome
+        switch outcome {
+        case .switched:
+            onSpaceChange?()
+            return true
+        case .alreadyCurrent:
+            return true
+        case .outOfRange, .superseded, .failed:
+            return false
+        }
+    }
+
+    private func performSwitch(userSpace n: Int, on display: DisplaySnapshot) async -> SpaceSwitchOutcome {
+        // Read a fresh snapshot: the caller's snapshot can be old.
+        let fresh = displays().first { $0.id == display.id } ?? display
+        let users = fresh.userSpaces
+        guard n >= 1, n <= users.count else {
+            log.info("Space \(n) does not exist on \(fresh.id.uuid, privacy: .public) (\(users.count) user Spaces)")
+            return .outOfRange
+        }
+        let target = users[n - 1].id
+        if currentSpace(of: fresh.id) == target { return .alreadyCurrent }
+
+        let ordered = orderedSwitchStrategies()
+        for strategy in ordered where strategy.isAvailable() {
+            if await strategy.switchTo(target, on: fresh) {
+                if cachedSwitchStrategy != strategy.name {
+                    log.info("Space switch strategy: \(strategy.name, privacy: .public)")
+                }
+                cachedSwitchStrategy = strategy.name
+                return .switched(strategy: strategy.name)
+            }
+            log.warning("Space switch strategy \(strategy.name, privacy: .public) failed for \(target.description, privacy: .public)")
+            // Stop when the display reached the target late.
+            if currentSpace(of: fresh.id) == target {
+                return .switched(strategy: strategy.name)
+            }
+        }
+        log.error("Space switch to \(n) on \(fresh.id.uuid, privacy: .public) failed: no strategy verified")
+        return .failed
+    }
+
+    private func orderedSwitchStrategies() -> [SpaceSwitchStrategy] {
+        guard let cached = cachedSwitchStrategy,
+              let first = switchStrategies.first(where: { $0.name == cached })
+        else { return switchStrategies }
+        return [first] + switchStrategies.filter { $0 !== first }
+    }
+
+    private func orderedMoveStrategies() -> [WindowMoveStrategy] {
+        guard let cached = cachedMoveStrategy,
+              let first = moveStrategies.first(where: { $0.name == cached })
+        else { return moveStrategies }
+        return [first] + moveStrategies.filter { $0 !== first }
     }
 
     /// Moves `w` to the Nth user Space of its display (1-based).
+    ///
+    /// Returns true when `SLSCopySpacesForWindows` lists the target Space.
+    /// Returns true without a move when `w` is already on the target.
     public func move(_ w: WindowID, toUserSpace n: Int, on display: DisplaySnapshot) async -> Bool {
-        fatalError("TODO")
+        let fresh = displays().first { $0.id == display.id } ?? display
+        let users = fresh.userSpaces
+        guard n >= 1, n <= users.count else {
+            log.info("Space \(n) does not exist on \(fresh.id.uuid, privacy: .public); window \(w.description, privacy: .public) stays")
+            return false
+        }
+        let target = users[n - 1].id
+        if spaces(of: w).contains(target) { return true }
+
+        for strategy in orderedMoveStrategies() where strategy.isAvailable() {
+            if await strategy.move(w, to: target) {
+                if cachedMoveStrategy != strategy.name {
+                    log.info("Window move strategy: \(strategy.name, privacy: .public)")
+                }
+                cachedMoveStrategy = strategy.name
+                onSpaceChange?()
+                return true
+            }
+            log.warning("Window move strategy \(strategy.name, privacy: .public) failed for \(w.description, privacy: .public) -> \(target.description, privacy: .public)")
+        }
+        log.error("Window move of \(w.description, privacy: .public) to Space \(n) failed: no strategy verified")
+        return false
     }
 }
+
+// MARK: - Switch strategies
 
 /// Synthetic Dock swipe (yabai v7.1.19 method). Primary strategy.
 /// It warps the cursor to the target display, posts one swipe per step,
@@ -127,30 +407,274 @@ public final class SpaceManager {
 public final class GestureSwitch: SpaceSwitchStrategy {
     public let name = "gesture"
     public var warpCursor: Bool
+    /// Sign multiplier for swipe progress. The strategy flips it when a
+    /// round moves the display the wrong way.
+    public private(set) var directionFactor: Double = 1
+
+    private let log = Logger(subsystem: "com.simplewm.app", category: "gesture")
+    private static let maxRounds = 2
+
+    // CGEvent field numbers from yabai v7.1.19 (private).
+    private static let fieldEventType: UInt32 = 55          // kCGSEventTypeField
+    private static let fieldGestureHIDType: UInt32 = 110    // kCGEventGestureHIDType
+    private static let fieldSwipeMotion: UInt32 = 123       // kCGEventGestureSwipeMotion
+    private static let fieldSwipeProgress: UInt32 = 124     // kCGEventGestureSwipeProgress
+    private static let fieldSwipeVelocityX: UInt32 = 129    // kCGEventGestureSwipeVelocityX
+    private static let fieldGesturePhase: UInt32 = 132      // kCGEventGesturePhase
+    private static let dockControlEventType: Int64 = 30     // kCGSEventDockControl
+    private static let dockSwipeHIDType: Int64 = 23         // kIOHIDEventTypeDockSwipe
+    private static let swipeMotionHorizontal: Int64 = 1
+    private static let phaseBegan: Int64 = 1
+    private static let phaseEnded: Int64 = 4
+
     public init(warpCursor: Bool = true) { self.warpCursor = warpCursor }
-    public func isAvailable() -> Bool { fatalError("TODO") }
-    public func switchTo(_ target: SpaceID, on display: DisplaySnapshot) async -> Bool { fatalError("TODO") }
+
+    public func isAvailable() -> Bool {
+        let sl = SkyLight.shared
+        return sl.copyManagedDisplaySpaces != nil && sl.managedDisplayGetCurrentSpace != nil
+    }
+
+    public func switchTo(_ target: SpaceID, on display: DisplaySnapshot) async -> Bool {
+        guard isAvailable() else { return false }
+
+        // Warp only when the cursor is on another display.
+        var restorePoint: CGPoint?
+        if warpCursor, let here = CGEvent(source: nil)?.location {
+            let f = display.frame
+            if !f.contains(x: Double(here.x), y: Double(here.y)) {
+                restorePoint = here
+                CGWarpMouseCursorPosition(CGPoint(x: f.midX, y: f.midY))
+                // Cancel the short local-event suppression after a warp.
+                CGAssociateMouseAndMouseCursorPosition(1)
+            }
+        }
+        defer {
+            if let p = restorePoint {
+                CGWarpMouseCursorPosition(p)
+                CGAssociateMouseAndMouseCursorPosition(1)
+            }
+        }
+
+        for round in 1...Self.maxRounds {
+            // yabai refuses to switch while the display animates. Wait instead.
+            await SpaceReader.waitWhileAnimating(display.id, timeoutMs: 600)
+            let spaces = SpaceReader.spaces(ofDisplay: display.id)?.map(\.id) ?? display.spaces.map(\.id)
+            guard let current = SpaceReader.currentSpace(of: display.id) else { return false }
+            if current == target { return true }
+            guard let targetIndex = spaces.firstIndex(of: target),
+                  let currentIndex = spaces.firstIndex(of: current)
+            else {
+                log.warning("Gesture: Space \(target.description, privacy: .public) or \(current.description, privacy: .public) not in list")
+                return false
+            }
+            let delta = targetIndex - currentIndex
+            let sign: Double = delta > 0 ? 1 : -1
+            postSwipes(steps: abs(delta), sign: sign * directionFactor, at: display)
+
+            if await SpaceReader.waitForCurrentSpace(target, on: display.id, timeoutMs: 600) {
+                return true
+            }
+            await SpaceReader.waitWhileAnimating(display.id, timeoutMs: 600)
+            if SpaceReader.currentSpace(of: display.id) == target { return true }
+
+            // Learn the swipe direction when the display moved the wrong way.
+            if let after = SpaceReader.currentSpace(of: display.id),
+               let afterIndex = spaces.firstIndex(of: after),
+               afterIndex != currentIndex,
+               (afterIndex - currentIndex > 0) != (delta > 0) {
+                directionFactor = -directionFactor
+                log.notice("Gesture: swipe direction flipped (round \(round))")
+            }
+        }
+        return false
+    }
+
+    /// Posts `steps` swipe pairs (began, ended) to the session event tap.
+    private func postSwipes(steps: Int, sign: Double, at display: DisplaySnapshot) {
+        guard steps > 0, let event = CGEvent(source: nil) else { return }
+        func setInt(_ field: UInt32, _ value: Int64) {
+            guard let f = CGEventField(rawValue: field) else { return }
+            event.setIntegerValueField(f, value: value)
+        }
+        func setDouble(_ field: UInt32, _ value: Double) {
+            guard let f = CGEventField(rawValue: field) else { return }
+            event.setDoubleValueField(f, value: value)
+        }
+        // With a warp, the event keeps the real cursor location (yabai does
+        // the same). Without a warp, point the event at the target display.
+        if !warpCursor {
+            event.location = CGPoint(x: display.frame.midX, y: display.frame.midY)
+        }
+        setInt(Self.fieldEventType, Self.dockControlEventType)
+        setInt(Self.fieldGestureHIDType, Self.dockSwipeHIDType)
+        setInt(Self.fieldSwipeMotion, Self.swipeMotionHorizontal)
+        setDouble(Self.fieldSwipeProgress, sign)
+        setDouble(Self.fieldSwipeVelocityX, sign * 9999.0)
+        for _ in 0..<steps {
+            setInt(Self.fieldGesturePhase, Self.phaseBegan)
+            event.post(tap: .cgSessionEventTap)
+            setInt(Self.fieldGesturePhase, Self.phaseEnded)
+            event.post(tap: .cgSessionEventTap)
+        }
+    }
 }
 
 /// Posts Ctrl+N as a CGEvent. Runs only when "Switch to Desktop N" is enabled
 /// in `com.apple.symbolichotkeys` (IDs 118...126). Mission Control may count
 /// fullscreen Spaces, so the strategy verifies the result.
+///
+/// N is the global index of the target among user Spaces of all displays, in
+/// `SLSCopyManagedDisplaySpaces` order. Mission Control numbers desktops across
+/// displays this way. The key code and modifiers come from the shortcut entry.
 @MainActor
 public final class ControlKeySwitch: SpaceSwitchStrategy {
     public let name = "ctrl-n"
+    private let log = Logger(subsystem: "com.simplewm.app", category: "ctrl-n")
+
+    /// First symbolic hotkey ID: "Switch to Desktop 1".
+    static let firstHotKeyID = 118
+    /// Mission Control offers shortcuts for desktops 1...16 (IDs 118...133).
+    static let maxDesktop = 16
+
     public init() {}
-    public func isAvailable() -> Bool { fatalError("TODO") }
-    public func switchTo(_ target: SpaceID, on display: DisplaySnapshot) async -> Bool { fatalError("TODO") }
+
+    public func isAvailable() -> Bool {
+        let sl = SkyLight.shared
+        guard sl.copyManagedDisplaySpaces != nil, sl.managedDisplayGetCurrentSpace != nil else { return false }
+        let table = Self.readHotKeys()
+        return (1...9).contains { Self.shortcut(desktop: $0, in: table) != nil }
+    }
+
+    public func switchTo(_ target: SpaceID, on display: DisplaySnapshot) async -> Bool {
+        guard let n = Self.desktopNumber(of: target) else {
+            log.warning("Ctrl-N: Space \(target.description, privacy: .public) has no desktop number")
+            return false
+        }
+        guard let key = Self.shortcut(desktop: n, in: Self.readHotKeys()) else {
+            log.info("Ctrl-N: shortcut for Desktop \(n) is disabled")
+            return false
+        }
+        let src = CGEventSource(stateID: .hidSystemState)
+        guard let down = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: src, virtualKey: key.keyCode, keyDown: false)
+        else { return false }
+        down.flags = key.flags
+        up.flags = key.flags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        return await SpaceReader.waitForCurrentSpace(target, on: display.id, timeoutMs: 600)
+    }
+
+    /// Global 1-based index of `target` among user Spaces of all displays.
+    static func desktopNumber(of target: SpaceID) -> Int? {
+        var n = 0
+        for display in SpaceReader.rawDisplays() {
+            for space in display.spaces where space.isUser {
+                n += 1
+                if space.id == target { return n <= maxDesktop ? n : nil }
+            }
+        }
+        return nil
+    }
+
+    /// Key code and flags of one "Switch to Desktop N" shortcut.
+    struct Shortcut {
+        let keyCode: CGKeyCode
+        let flags: CGEventFlags
+    }
+
+    /// Reads `AppleSymbolicHotKeys` from `com.apple.symbolichotkeys`.
+    static func readHotKeys() -> [String: Any] {
+        let app = "com.apple.symbolichotkeys" as CFString
+        CFPreferencesAppSynchronize(app)
+        guard let value = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, app),
+              let dict = value as? [String: Any]
+        else { return [:] }
+        return dict
+    }
+
+    /// Returns the enabled shortcut for desktop `n`, or nil. A missing entry
+    /// counts as disabled (the macOS default).
+    static func shortcut(desktop n: Int, in table: [String: Any]) -> Shortcut? {
+        guard (1...maxDesktop).contains(n),
+              let entry = table[String(firstHotKeyID + n - 1)] as? [String: Any],
+              (entry["enabled"] as? NSNumber)?.boolValue == true
+        else { return nil }
+        // Default: Ctrl + digit row key (kVK_ANSI_1 ... kVK_ANSI_9).
+        let digitCodes: [CGKeyCode] = [0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19]
+        var keyCode: CGKeyCode? = n <= 9 ? digitCodes[n - 1] : nil
+        var flags: CGEventFlags = .maskControl
+        if let value = entry["value"] as? [String: Any],
+           let params = value["parameters"] as? [NSNumber], params.count >= 3 {
+            let code = params[1].intValue
+            if code >= 0, code < 0xFFFF { keyCode = CGKeyCode(code) }
+            let mods = params[2].uint64Value
+            if mods != 0 { flags = CGEventFlags(rawValue: mods) }
+        }
+        guard let keyCode else { return nil }
+        return Shortcut(keyCode: keyCode, flags: flags)
+    }
 }
+
+// MARK: - Move strategies
 
 /// `SLSBridgedMoveWindowsToManagedSpaceOperation` run by the file-local
 /// `SLSPerformAsynchronousBridgedWindowManagementOperation`.
+///
+/// The operation is built with the Objective-C runtime: `+alloc`, then
+/// `-initWithWindows:spaceID:`. The window list holds `NSNumber` values.
 @MainActor
 public final class BridgedMove: WindowMoveStrategy {
     public let name = "bridged"
+    private let log = Logger(subsystem: "com.simplewm.app", category: "move")
+
+    static let className = "SLSBridgedMoveWindowsToManagedSpaceOperation"
+    static let initSelector = NSSelectorFromString("initWithWindows:spaceID:")
+
+    typealias AllocFn = @convention(c) (AnyClass, Selector) -> Unmanaged<AnyObject>?
+    typealias InitFn = @convention(c) (Unmanaged<AnyObject>, Selector, NSArray, UInt64) -> Unmanaged<AnyObject>?
+
     public init() {}
-    public func isAvailable() -> Bool { fatalError("TODO") }
-    public func move(_ w: WindowID, to target: SpaceID) async -> Bool { fatalError("TODO") }
+
+    public func isAvailable() -> Bool {
+        let sl = SkyLight.shared
+        guard sl.performBridgedOperation != nil, sl.copySpacesForWindows != nil,
+              let cls = NSClassFromString(Self.className)
+        else { return false }
+        return class_getInstanceMethod(cls, Self.initSelector) != nil
+    }
+
+    public func move(_ w: WindowID, to target: SpaceID) async -> Bool {
+        guard isAvailable(),
+              let perform = SkyLight.shared.performBridgedOperation,
+              let op = makeOperation(windows: [w], space: target)
+        else { return false }
+        _ = perform(op)
+        return await SpaceReader.waitForWindow(w, on: target, timeoutMs: 500)
+    }
+
+    /// Creates the operation object. Returns nil when the runtime refuses.
+    func makeOperation(windows: [WindowID], space: SpaceID) -> AnyObject? {
+        guard let cls = NSClassFromString(Self.className),
+              let meta = object_getClass(cls)
+        else { return nil }
+        let allocSel = NSSelectorFromString("alloc")
+        guard class_getInstanceMethod(meta, allocSel) != nil,
+              class_getInstanceMethod(cls, Self.initSelector) != nil,
+              let allocIMP = class_getMethodImplementation(meta, allocSel),
+              let initIMP = class_getMethodImplementation(cls, Self.initSelector)
+        else { return nil }
+        let alloc = unsafeBitCast(allocIMP, to: AllocFn.self)
+        let initialize = unsafeBitCast(initIMP, to: InitFn.self)
+        // `alloc` returns +1. `init` consumes it and returns +1.
+        guard let allocated = alloc(cls, allocSel) else { return nil }
+        let list = windows.map { NSNumber(value: Int32(bitPattern: $0.raw)) } as NSArray
+        guard let op = initialize(allocated, Self.initSelector, list, space.raw) else {
+            log.warning("Bridged: initWithWindows:spaceID: returned nil")
+            return nil
+        }
+        return op.takeRetainedValue()
+    }
 }
 
 /// Compat-ID trick: `SLSSpaceSetCompatID(sid, 0x79616265)`,
@@ -158,9 +682,32 @@ public final class BridgedMove: WindowMoveStrategy {
 @MainActor
 public final class CompatIDMove: WindowMoveStrategy {
     public let name = "compat-id"
+    /// Temporary workspace number ("yabe", from yabai).
+    static let compatID: Int32 = 0x79616265
+    private let log = Logger(subsystem: "com.simplewm.app", category: "move")
+
     public init() {}
-    public func isAvailable() -> Bool { fatalError("TODO") }
-    public func move(_ w: WindowID, to target: SpaceID) async -> Bool { fatalError("TODO") }
+
+    public func isAvailable() -> Bool {
+        let sl = SkyLight.shared
+        return sl.spaceSetCompatID != nil && sl.setWindowListWorkspace != nil && sl.copySpacesForWindows != nil
+    }
+
+    public func move(_ w: WindowID, to target: SpaceID) async -> Bool {
+        let sl = SkyLight.shared
+        guard let setCompat = sl.spaceSetCompatID, let setWorkspace = sl.setWindowListWorkspace,
+              sl.copySpacesForWindows != nil
+        else { return false }
+        let e1 = setCompat(sl.cid, target.raw, Self.compatID)
+        var wid = w.raw
+        let e2 = setWorkspace(sl.cid, &wid, 1, Self.compatID)
+        // Always clear the compat ID, also after an error.
+        let e3 = setCompat(sl.cid, target.raw, 0)
+        if e1 != .success || e2 != .success || e3 != .success {
+            log.debug("Compat-ID: status \(e1.rawValue) \(e2.rawValue) \(e3.rawValue)")
+        }
+        return await SpaceReader.waitForWindow(w, on: target, timeoutMs: 500)
+    }
 }
 
 /// Plain `SLSMoveWindowsToManagedSpace`. Known to fail silently on 14.5+.
@@ -168,6 +715,17 @@ public final class CompatIDMove: WindowMoveStrategy {
 public final class ManagedSpaceMove: WindowMoveStrategy {
     public let name = "managed-space"
     public init() {}
-    public func isAvailable() -> Bool { fatalError("TODO") }
-    public func move(_ w: WindowID, to target: SpaceID) async -> Bool { fatalError("TODO") }
+
+    public func isAvailable() -> Bool {
+        let sl = SkyLight.shared
+        return sl.moveWindowsToManagedSpace != nil && sl.copySpacesForWindows != nil
+    }
+
+    public func move(_ w: WindowID, to target: SpaceID) async -> Bool {
+        let sl = SkyLight.shared
+        guard let fn = sl.moveWindowsToManagedSpace else { return false }
+        let list = [NSNumber(value: Int32(bitPattern: w.raw))] as CFArray
+        fn(sl.cid, list, target.raw)
+        return await SpaceReader.waitForWindow(w, on: target, timeoutMs: 500)
+    }
 }

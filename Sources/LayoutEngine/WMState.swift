@@ -33,7 +33,13 @@ public struct WMState: Equatable, Sendable {
     /// Moves `w` from one tree to another. The window becomes focused in the
     /// destination. Does nothing when `w` is absent from `from`.
     public mutating func transfer(_ w: WindowID, from: SpaceKey, to: SpaceKey) {
-        fatalError("TODO")
+        guard from != to, var source = trees[from], source.contains(w) else { return }
+        source.remove(w)
+        trees[from] = source
+        update(to) { tree in
+            tree.insert(w)
+            tree.setFocus(w)
+        }
     }
 
     /// Drops trees whose key is not in `live`.
