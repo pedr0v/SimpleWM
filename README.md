@@ -55,9 +55,9 @@ The status item shows a split icon and a short title:
 
 | Title | Meaning |
 |-------|---------|
-| `WM`  | Enabled. Tiling runs. |
-| `WM!` | Warning: no Accessibility grant, AeroSpace runs, or the last Space switch or move failed. |
-| `WM·` | Disabled. |
+| `sWM`  | Enabled. Tiling runs. |
+| `sWM!` | Warning: no Accessibility grant, AeroSpace runs, or the last Space switch or move failed. |
+| `sWM·` | Disabled. |
 
 Menu items: Enabled (toggle), Open Config, Reload Config, Quit. When a
 warning is active, the first menu row shows the reason.
@@ -205,7 +205,7 @@ SIMPLEWM_DRY_RUN=1 .build/debug/SimpleWM
   change the chord in the config.
 - **Log shows a missing symbol.** This macOS version does not have that
   SkyLight function. The related feature is off. Other features still work.
-- **Title shows `WM!`.** Open the menu. The first row shows the reason.
+- **Title shows `sWM!`.** Open the menu. The first row shows the reason.
   - "Accessibility not granted": grant it (see Install, step 4).
   - "AeroSpace is running": quit AeroSpace. Tiling starts again in 2 s.
   - "Last Space switch or move failed": read the log. Turn on "Switch to

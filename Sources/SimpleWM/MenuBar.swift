@@ -1,12 +1,12 @@
 import AppKit
 
 /// Status item with: Enable/Disable, Open Config, Reload Config, Quit.
-/// The title shows `WM` normally and `WM!` after a failed Space switch.
+/// The title shows `sWM` normally and `sWM!` after a failed Space switch.
 ///
 /// Title states:
-/// - `WM`: enabled, no warning.
-/// - `WM!`: a warning is active, or the Accessibility grant is missing.
-/// - `WM·`: disabled.
+/// - `sWM`: enabled, no warning.
+/// - `sWM!`: a warning is active, or the Accessibility grant is missing.
+/// - `sWM·`: disabled.
 @MainActor
 public final class MenuBar: NSObject {
     public let item: NSStatusItem
@@ -30,7 +30,7 @@ public final class MenuBar: NSObject {
             image?.isTemplate = true
             button.image = image
             button.imagePosition = .imageLeading
-            button.title = "WM"
+            button.title = "sWM"
             button.toolTip = "SimpleWM"
         }
 
@@ -59,11 +59,11 @@ public final class MenuBar: NSObject {
         // A warning has priority over the disabled mark.
         let title: String
         if warning || !accessibilityGranted {
-            title = "WM!"
+            title = "sWM!"
         } else if !enabled {
-            title = "WM\u{00B7}"
+            title = "sWM\u{00B7}"
         } else {
-            title = "WM"
+            title = "sWM"
         }
         item.button?.title = title
         enabledMenuItem.state = enabled ? .on : .off

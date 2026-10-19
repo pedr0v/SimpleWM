@@ -53,7 +53,7 @@ Verification polls `SLSManagedDisplayGetCurrentSpace` every 30 ms. The wait is
    nothing makes the next round warp the cursor.
 2. `ControlKeySwitch`: post Ctrl+N. Runs only when "Switch to Desktop N" is
    enabled (`com.apple.symbolichotkeys` IDs 118..126). Verify.
-3. Failure: log and show `WM!` in the menu bar.
+3. Failure: log and show `sWM!` in the menu bar.
 
 ## Move window to Space N
 
