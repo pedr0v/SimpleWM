@@ -40,11 +40,39 @@ jobs:
           export SIMPLEWM_NOTARIZE=1
           scripts/make-app.sh
 
+      # Sparkle reads releases/latest/download/appcast.xml. The appcast lists
+      # this release only. Its EdDSA signature uses the SPARKLE_PRIVATE_KEY
+      # secret. The key goes to generate_appcast on stdin, never to a file.
+      - name: Generate Sparkle appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$SPARKLE_PRIVATE_KEY" ] || { echo "Set the SPARKLE_PRIVATE_KEY secret." >&2; exit 1; }
+          VERSION="${GITHUB_REF_NAME#v}"
+          # make-app.sh resolved the Sparkle package, so its tools are in .build/artifacts.
+          GENERATE_APPCAST="$(find .build/artifacts -type f -path '*/bin/generate_appcast' | head -1)"
+          [ -x "$GENERATE_APPCAST" ] || { echo "generate_appcast not found." >&2; exit 1; }
+          ARCHIVES="$RUNNER_TEMP/appcast"
+          rm -rf "$ARCHIVES"
+          mkdir -p "$ARCHIVES"
+          cp "dist/SimpleWM-$VERSION.zip" "$ARCHIVES/"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$GENERATE_APPCAST" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/pedr0v/SimpleWM/releases/download/$GITHUB_REF_NAME/" \
+            --full-release-notes-url "https://github.com/pedr0v/SimpleWM/releases/tag/$GITHUB_REF_NAME" \
+            --link "https://github.com/pedr0v/SimpleWM" \
+            --maximum-deltas 0 \
+            -o "$GITHUB_WORKSPACE/dist/appcast.xml" \
+            "$ARCHIVES"
+          grep -q "sparkle:edSignature" dist/appcast.xml || { echo "The appcast has no EdDSA signature." >&2; exit 1; }
+          cat dist/appcast.xml
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" "dist/SimpleWM-$VERSION.zip" \
+          gh release create "$GITHUB_REF_NAME" "dist/SimpleWM-$VERSION.zip" dist/appcast.xml \
             --title "SimpleWM $VERSION" --generate-notes

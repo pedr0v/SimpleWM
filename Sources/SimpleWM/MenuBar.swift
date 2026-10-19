@@ -1,21 +1,32 @@
 import AppKit
 
-/// Status item with: Enable/Disable, Open Config, Reload Config, Quit.
+/// Status item with: Enable/Disable, Open Config, Reload Config, the update item, Quit.
 /// The title shows `sWM` normally and `sWM!` after a failed Space switch.
 ///
 /// Title states:
 /// - `sWM`: enabled, no warning.
 /// - `sWM!`: a warning is active, or the Accessibility grant is missing.
 /// - `sWM·`: disabled.
+///
+/// The update item shows "Verificar atualizações" by default. When the updater
+/// finds a new version V, it shows "Atualizar (vV)". The item stays hidden
+/// until `onCheckForUpdates` is set.
 @MainActor
 public final class MenuBar: NSObject {
     public let item: NSStatusItem
     public var onToggleEnabled: (() -> Void)?
     public var onOpenConfig: (() -> Void)?
     public var onReloadConfig: (() -> Void)?
+    public var onCheckForUpdates: (() -> Void)? {
+        didSet { updateMenuItem.isHidden = onCheckForUpdates == nil }
+    }
 
     private let statusMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let enabledMenuItem = NSMenuItem(title: "Enabled", action: nil, keyEquivalent: "")
+    private let updateMenuItem = NSMenuItem(title: MenuBar.checkForUpdatesTitle, action: nil, keyEquivalent: "")
+
+    static let checkForUpdatesTitle = "Verificar atualizações"
+    static func updateTitle(version: String) -> String { "Atualizar (v\(version))" }
 
     public override init() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -48,6 +59,12 @@ public final class MenuBar: NSObject {
 
         menu.addItem(makeItem("Open Config", #selector(openConfig), key: ","))
         menu.addItem(makeItem("Reload Config", #selector(reloadConfig), key: "r"))
+
+        updateMenuItem.target = self
+        updateMenuItem.action = #selector(checkForUpdates)
+        updateMenuItem.isHidden = onCheckForUpdates == nil
+        menu.addItem(updateMenuItem)
+
         menu.addItem(.separator())
         menu.addItem(makeItem("Quit", #selector(quit), key: "q"))
 
@@ -76,6 +93,15 @@ public final class MenuBar: NSObject {
         item.button?.toolTip = text.map { "SimpleWM: \($0)" } ?? "SimpleWM"
     }
 
+    /// Shows "Atualizar (vV)" for a new version V. Nil shows "Verificar atualizações".
+    public func setAvailableUpdate(version: String?) {
+        if let version, !version.isEmpty {
+            updateMenuItem.title = Self.updateTitle(version: version)
+        } else {
+            updateMenuItem.title = Self.checkForUpdatesTitle
+        }
+    }
+
     private func makeItem(_ title: String, _ action: Selector, key: String) -> NSMenuItem {
         let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: key)
         menuItem.target = self
@@ -85,5 +111,6 @@ public final class MenuBar: NSObject {
     @objc private func toggleEnabled() { onToggleEnabled?() }
     @objc private func openConfig() { onOpenConfig?() }
     @objc private func reloadConfig() { onReloadConfig?() }
+    @objc private func checkForUpdates() { onCheckForUpdates?() }
     @objc private func quit() { NSApp.terminate(nil) }
 }

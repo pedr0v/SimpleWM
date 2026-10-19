@@ -10,8 +10,10 @@ with `dlsym`.
 - `swift-tools-version:5.10`, `.macOS(.v14)`, Swift language mode 5.
 - `LayoutEngine`: Foundation only. Value types. Testable.
 - `MacOSBridge`: SkyLight loader, Space manager, AX windows, observers, hotkeys.
-- `SimpleWM`: executable. Config, controller, menu bar.
-- `scripts/make-app.sh`: release build, `dist/SimpleWM.app`, codesign.
+- `SimpleWM`: executable. Config, controller, menu bar, updater.
+- Dependency: Sparkle 2 (exact version in `Package.swift`), for the updater.
+- `scripts/make-app.sh`: release build, `dist/SimpleWM.app`, embedded
+  `Sparkle.framework`, codesign.
 
 ## Decisions
 
@@ -40,6 +42,31 @@ with `dlsym`.
     Mission Control through Accessibility. It does not call `SLSSpaceCreate`:
     a process other than the Dock gets a Space that no display owns. The
     creator is `SpaceCreator`. The sequence is in "Create Space".
+11. The app installs an update only after the user agrees. See "Updates".
+
+## Updates
+
+`Updater` wraps a Sparkle `SPUUpdater` with the standard user driver.
+
+- `Info.plist` sets `SUEnableAutomaticChecks`, `SUAutomaticallyUpdate`, and
+  `SUAllowsAutomaticUpdates` to false. Sparkle never schedules a check and
+  never opens a window on its own. The update window has no "install
+  automatically" option.
+- A timer calls `checkForUpdateInformation` 10 s after the start and then
+  every 24 h. This probe reads the appcast only. The delegate reports the
+  result: `didFindValidUpdate` sets the menu item to "Atualizar (vX.Y.Z)",
+  `updaterDidNotFindUpdate` sets it to "Verificar atualizações".
+- A click on the menu item calls `checkForUpdates`. The Sparkle window opens.
+  The download and the install start only after "Install Update".
+- "Skip This Version" resets the menu item. Probes do not report a skipped
+  version.
+- The updater starts only inside an app bundle with `SUFeedURL`. A start
+  error only logs. The menu then has no update item.
+- The feed is `releases/latest/download/appcast.xml` on GitHub. The release
+  workflow signs each archive with the EdDSA key in `SPARKLE_PRIVATE_KEY`.
+- The app is not sandboxed, so `make-app.sh` removes the Sparkle XPC
+  services. It signs `Autoupdate`, `Updater.app`, the framework, and the app
+  in that order, with the hardened runtime and a timestamp.
 
 ## Space switching
 

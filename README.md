@@ -34,6 +34,23 @@ Requirements: macOS 14 or later (tested on macOS 26.1). To build from source: Xc
 The release is signed with a Developer ID and notarized. The Accessibility
 grant survives updates.
 
+### Updates
+
+The app uses [Sparkle](https://sparkle-project.org) 2. It never installs an
+update without your permission.
+
+- The app reads the appcast of the latest GitHub release 10 s after it
+  starts and then every 24 h. This check shows no window and downloads no
+  release.
+- When a newer version exists, the menu item "Verificar atualizações"
+  changes to "Atualizar (vX.Y.Z)".
+- Click the item. The Sparkle window shows the new version. Click "Install
+  Update" to download and install it. Sparkle then relaunches the app.
+- "Verificar atualizações" checks now and shows the result in a window.
+- "Skip This Version" hides that version until you check by hand.
+
+Sparkle checks the EdDSA signature of each update before it installs it.
+
 ### From source
 
 ```sh
@@ -66,8 +83,12 @@ The status item shows a split icon and a short title:
 | `sWM!` | Warning: no Accessibility grant, AeroSpace runs, or the last Space switch, creation, or move failed. |
 | `sWM·` | Disabled. |
 
-Menu items: Enabled (toggle), Open Config, Reload Config, Quit. When a
-warning is active, the first menu row shows the reason.
+Menu items: Enabled (toggle), Open Config, Reload Config, the update item,
+Quit. When a warning is active, the first menu row shows the reason.
+
+The update item shows "Verificar atualizações", or "Atualizar (vX.Y.Z)" when
+a newer release exists (see Updates). A build that runs outside the app
+bundle (`.build/debug/SimpleWM`) has no update item.
 
 ## Default bindings
 

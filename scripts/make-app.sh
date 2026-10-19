@@ -13,6 +13,10 @@
 #
 # Ad-hoc signing changes the cdhash on each build, so macOS drops the
 # Accessibility grant. A Developer ID identity keeps the grant.
+#
+# The app embeds Sparkle.framework in Contents/Frameworks. The script signs
+# the Sparkle helpers first, then the framework, then the app. It does not
+# use --deep: the Sparkle documentation advises against it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,6 +25,13 @@ APP="$DIST/SimpleWM.app"
 BUNDLE_ID="com.simplewm.app"
 VERSION="${SIMPLEWM_VERSION:-0.1.0}"
 ZIP="$DIST/SimpleWM-$VERSION.zip"
+
+# Sparkle reads the appcast of the latest GitHub release. The release
+# workflow uploads appcast.xml next to the zip.
+SPARKLE_FEED_URL="https://github.com/pedr0v/SimpleWM/releases/latest/download/appcast.xml"
+# Public half of the EdDSA key. The private half is in the login keychain of
+# the maintainer (generate_keys) and in the SPARKLE_PRIVATE_KEY CI secret.
+SPARKLE_PUBLIC_KEY="OEkmAbOu/rg6+cqM5Idc2BpsxFuD/Uud3qNyXt5QP9s="
 
 detect_identity() {
   security find-identity -v -p codesigning 2>/dev/null \
@@ -31,13 +42,24 @@ IDENTITY="${IDENTITY:--}"
 
 echo "==> swift build -c release"
 swift build -c release --package-path "$ROOT"
-BIN="$(swift build -c release --package-path "$ROOT" --show-bin-path)/SimpleWM"
+BIN_DIR="$(swift build -c release --package-path "$ROOT" --show-bin-path)"
+BIN="$BIN_DIR/SimpleWM"
 test -x "$BIN"
+test -d "$BIN_DIR/Sparkle.framework"
 
 echo "==> assembling $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN" "$APP/Contents/MacOS/SimpleWM"
+# The binary loads @rpath/Sparkle.framework. Add the bundle Frameworks folder to the rpath.
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/SimpleWM"
+
+SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+# ditto keeps the symlinks of the framework.
+ditto "$BIN_DIR/Sparkle.framework" "$SPARKLE"
+# The app is not sandboxed. Sparkle uses its XPC services only in a sandboxed
+# app (SUEnableInstallerLauncherService, SUEnableDownloaderService).
+rm -rf "$SPARKLE/Versions/B/XPCServices" "$SPARKLE/XPCServices"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -55,19 +77,35 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>SimpleWM</string>
+    <key>SUFeedURL</key><string>$SPARKLE_FEED_URL</string>
+    <key>SUPublicEDKey</key><string>$SPARKLE_PUBLIC_KEY</string>
+    <key>SUEnableAutomaticChecks</key><false/>
+    <key>SUAutomaticallyUpdate</key><false/>
+    <key>SUAllowsAutomaticUpdates</key><false/>
 </dict>
 </plist>
 PLIST
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+sign() {
+  if [ "$IDENTITY" = "-" ]; then
+    codesign --force --sign "-" "$@"
+  else
+    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$@"
+  fi
+}
+
 if [ "$IDENTITY" = "-" ]; then
   echo "==> codesign (ad-hoc)"
-  codesign --force --deep --sign "-" "$APP"
 else
   echo "==> codesign ($IDENTITY, hardened runtime, timestamp)"
-  codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$APP"
 fi
-codesign --verify --verbose=2 "$APP"
+# Inner code first, outer code last.
+sign "$SPARKLE/Versions/B/Autoupdate"
+sign "$SPARKLE/Versions/B/Updater.app"
+sign "$SPARKLE"
+sign "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
 if [ "${SIMPLEWM_NOTARIZE:-0}" = "1" ]; then
   [ "$IDENTITY" != "-" ] || { echo "Notarization needs a Developer ID identity." >&2; exit 1; }
