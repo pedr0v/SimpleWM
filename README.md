@@ -5,6 +5,7 @@ macOS Spaces.
 
 - `Option+1..9` switches the focused display to its Nth native Space.
 - `Option+Shift+1..9` moves the focused window to Space N of its display.
+- When Space N does not exist, the app creates desktops until it does.
 - The app tiles the windows of each normal Space in an i3-style split tree.
 - Floating windows stay floating. Settings panels, dialogs, and windows
   without a zoom button keep their own size and position.
@@ -62,7 +63,7 @@ The status item shows a split icon and a short title:
 | Title | Meaning |
 |-------|---------|
 | `sWM`  | Enabled. Tiling runs. |
-| `sWM!` | Warning: no Accessibility grant, AeroSpace runs, or the last Space switch or move failed. |
+| `sWM!` | Warning: no Accessibility grant, AeroSpace runs, or the last Space switch, creation, or move failed. |
 | `sWM·` | Disabled. |
 
 Menu items: Enabled (toggle), Open Config, Reload Config, Quit. When a
@@ -85,8 +86,12 @@ warning is active, the first menu row shows the reason.
 
 `N` follows the Mission Control order of the focused display. A fullscreen
 app counts as one Space. `move-to-space N` only targets a normal desktop.
-The app never creates a Space. If Space N does not exist, the key does
-nothing.
+
+If Space N does not exist, the app creates desktops up to N on that display
+and then switches to Space N (`space N`) or moves the window there
+(`move-to-space N`). A workspace appears on demand, as in i3. The app
+creates at most 9 Spaces on a display. Set `createMissingSpaces` to `false`
+to turn this off. Then a key for a missing Space does nothing.
 
 Key codes are physical. The keyboard layout (for example ABNT2) does not
 change the bindings.
@@ -111,6 +116,7 @@ Config" to apply it.
     "alt-shift-minus" : "resize -0.05",
     "alt-shift-equal" : "resize 0.05"
   },
+  "createMissingSpaces" : true,
   "floatingApps" : [
     "com.apple.systempreferences"
   ],
@@ -138,6 +144,9 @@ Keys:
   - Commands: `focus D`, `move D`, `space N`, `move-to-space N`,
     `fullscreen`, `toggle-split`, `split horizontal|vertical`, `balance`,
     `resize X`, `toggle-float`.
+- `createMissingSpaces`: when `true` (default), `space N` and
+  `move-to-space N` create desktops on the focused display until it has N
+  Spaces. When `false`, a key for a missing Space does nothing.
 - `floatingApps`: bundle IDs that the app never tiles.
 - `floatWindowsWithoutZoom`: when `true` (default), a window without an
   enabled zoom button floats. System Settings and most utility panels have
@@ -158,8 +167,15 @@ good config, and the app logs the error. A bad binding is logged and skipped.
 - The app uses private SkyLight functions. A macOS update can remove or
   change them. The app logs each missing function and disables only that
   feature.
-- Spaces are native. The app does not create, delete, or reorder Spaces.
-  Make Spaces in Mission Control.
+- Spaces are native. The app does not delete or reorder Spaces. Delete and
+  reorder Spaces in Mission Control.
+- Creating a Space opens Mission Control for a moment (about half a second
+  for each Space). macOS has no public API for this. The app presses the
+  "+" button of Mission Control through Accessibility. It needs the
+  Accessibility grant. The new Space goes at the end of the list. The
+  current Space and the focus stay. A macOS update can change the Mission
+  Control layout. Then creation fails, the log shows the reason, and the
+  menu bar shows `sWM!`.
 - The app does not touch native fullscreen windows or their Spaces. A
   display that shows a fullscreen Space gets no tiling. `space N` still works.
 - macOS lists windows only on visible Spaces. The app updates a tree only
@@ -214,7 +230,11 @@ SIMPLEWM_DRY_RUN=1 .build/debug/SimpleWM
 - **Title shows `sWM!`.** Open the menu. The first row shows the reason.
   - "Accessibility not granted": grant it (see Install, step 4).
   - "AeroSpace is running": quit AeroSpace. Tiling starts again in 2 s.
-  - "Last Space switch or move failed": read the log. Turn on "Switch to
+  - "Last Space switch, creation, or move failed": read the log. Turn on "Switch to
     Desktop N" shortcuts to enable the `Ctrl+N` fallback.
+- **`space N` does not create a Space.** Check that `createMissingSpaces` is
+  not `false`, that Accessibility is granted, and that N is at most 9. Read
+  the log of the `spaces` category: it names the step that failed (Mission
+  Control did not open, no add button, no new Space).
 - **Windows do not tile after a rebuild.** The ad-hoc signature changed.
   Reset the grant with `tccutil` (see Install).

@@ -240,6 +240,8 @@ public final class SpaceManager {
 
     /// Outcome of the last `switchTo(userSpace:on:)` call.
     public private(set) var lastSwitchOutcome: SpaceSwitchOutcome?
+    /// Count of Spaces that the last `ensureSpaces` call created.
+    public private(set) var lastCreatedSpaceCount: Int = 0
     /// Name of the switch strategy that verified last. The manager tries it first.
     public private(set) var cachedSwitchStrategy: String?
     /// Name of the move strategy that verified last. The manager tries it first.
@@ -388,7 +390,7 @@ public final class SpaceManager {
     }
 
     /// Switches `display` to its Nth user Space (1-based). Does nothing when
-    /// N exceeds the count. Never creates a Space.
+    /// N exceeds the count. Never creates a Space: call `ensureSpaces` first.
     ///
     /// Returns true when the target Space is current after the call. A newer
     /// request replaces an older request that still waits; the older request
@@ -419,6 +421,65 @@ public final class SpaceManager {
         case .outOfRange, .superseded, .failed:
             return false
         }
+    }
+
+    /// Most Spaces per display that `ensureSpaces` creates. It matches the
+    /// largest N of `space N`.
+    public static let maxSpaceCount = 9
+
+    /// Creates desktops on `display` until it lists at least `n` Spaces.
+    ///
+    /// The cap for `n` is `maxSpaceCount`. The function creates at most
+    /// `maxSpaceCount` minus the current count of Spaces, one by one, and
+    /// reads the display again after each one. It does nothing when the
+    /// display has enough Spaces. It does not switch Spaces and does not
+    /// move windows: `switchTo(userSpace:on:)` and `move(_:toUserSpace:on:)`
+    /// stay as they are. The caller runs them with the fresh snapshot.
+    ///
+    /// The function holds the switch lock while it runs. A Space switch waits
+    /// for it. A tiling refresh waits for it too, because Mission Control is
+    /// open for a moment.
+    ///
+    /// Returns the fresh snapshot, or nil when a creation fails.
+    public func ensureSpaces(count n: Int, on display: DisplaySnapshot, creator: SpaceCreator) async -> DisplaySnapshot? {
+        let wanted = min(n, Self.maxSpaceCount)
+        // Wait for a running switch or creation. A stuck flag cannot block forever.
+        let waitUntil = Date().addingTimeInterval(8)
+        while switchBusy, Date() < waitUntil {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        guard !switchBusy else {
+            log.error("Create Spaces: the switch lock stays busy. Request dropped.")
+            return nil
+        }
+        switchBusy = true
+        defer { switchBusy = false }
+
+        lastCreatedSpaceCount = 0
+        var fresh = displays().first { $0.id == display.id } ?? display
+        let budget = max(0, Self.maxSpaceCount - fresh.spaces.count)
+        var created = 0
+        while fresh.spaces.count < wanted {
+            guard created < budget else {
+                log.error("Create Spaces: the cap of \(budget, privacy: .public) new Spaces is reached.")
+                return nil
+            }
+            guard await creator.createSpace(on: fresh) != nil else {
+                log.error("Create Spaces: creation \(created + 1, privacy: .public) failed on \(fresh.id.uuid, privacy: .public).")
+                return nil
+            }
+            created += 1
+            lastCreatedSpaceCount = created
+            guard let next = displays().first(where: { $0.id == display.id }) else {
+                log.error("Create Spaces: display \(display.id.uuid, privacy: .public) is gone after creation.")
+                return nil
+            }
+            fresh = next
+        }
+        if created > 0 {
+            log.info("Created \(created, privacy: .public) Space(s) on \(fresh.id.uuid, privacy: .public). The display has \(fresh.spaces.count, privacy: .public).")
+        }
+        return fresh
     }
 
     private func performSwitch(userSpace n: Int, on display: DisplaySnapshot) async -> SpaceSwitchOutcome {

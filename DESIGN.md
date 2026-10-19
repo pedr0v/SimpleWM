@@ -18,7 +18,8 @@ with `dlsym`.
 1. Spaces are native. The app never emulates workspaces.
 2. `N` in `space N` indexes all Spaces of the target display in `Spaces[]`
    order, which is the Mission Control order. A fullscreen Space counts.
-   `move-to-space N` only accepts a type-0 target. The app never creates a Space.
+   `move-to-space N` only accepts a type-0 target. When the display has fewer
+   than N Spaces, the app creates desktops first (decision 10).
 3. The app never calls `SLSManagedDisplaySetCurrentSpace`. Yabai calls it
    only inside the Dock.
 4. Target display for `space N`: display of the focused window, then the
@@ -34,6 +35,11 @@ with `dlsym`.
 8. Every private symbol is optional. A missing symbol disables one feature.
    This includes `_AXUIElementGetWindow`: the app loads it with `dlsym`.
 9. The app refuses to tile while AeroSpace (`bobko.aerospace`) runs.
+10. `space N` and `move-to-space N` create the missing Spaces when
+    `createMissingSpaces` is true (default). The app presses the "+" button of
+    Mission Control through Accessibility. It does not call `SLSSpaceCreate`:
+    a process other than the Dock gets a Space that no display owns. The
+    creator is `SpaceCreator`. The sequence is in "Create Space".
 
 ## Space switching
 
@@ -54,6 +60,55 @@ Verification polls `SLSManagedDisplayGetCurrentSpace` every 30 ms. The wait is
 2. `ControlKeySwitch`: post Ctrl+N. Runs only when "Switch to Desktop N" is
    enabled (`com.apple.symbolichotkeys` IDs 118..126). Verify.
 3. Failure: log and show `sWM!` in the menu bar.
+
+## Create Space
+
+`space N` and `move-to-space N` need N Spaces on the target display. The
+count includes fullscreen Spaces (decision 2). When the display has fewer
+than N Spaces, the controller calls `SpaceManager.ensureSpaces(count:on:creator:)`
+inside its existing `Task`. Then it continues with the fresh snapshot.
+`switchTo(userSpace:on:)` and `move(_:toUserSpace:on:)` stay as they are:
+they never create a Space.
+
+Rules of the controller:
+
+- It creates Spaces only when `createMissingSpaces` is true and N is at most 9.
+- It logs `space N: created K Space(s)` after a success. A success does not
+  set the menu bar warning. Only a failed creation, switch, or move does.
+- A failed creation stops the command. The window stays where it is.
+
+Rules of `ensureSpaces`:
+
+- It caps N at 9. It creates at most 9 minus the current count of Spaces.
+- It creates one Space at a time and reads the display again after each one.
+- It holds the switch lock. A Space switch and a tiling refresh wait for it.
+- It returns the fresh snapshot, or nil when a creation fails.
+
+Steps of `SpaceCreator.createSpace(on:)`. Waits 3 to 6 share a budget of 3 s.
+
+1. Check Accessibility trust and read the Space list of the display.
+2. Open Mission Control with `Mission Control.app` (`NSWorkspace`,
+   `activates = false`). The focus stays. It does not depend on the F3
+   shortcut. When the Dock already shows Mission Control, reuse it and leave
+   it open.
+3. Poll every 10 ms (2 s cap) for the Dock AX child with `AXIdentifier` `mc`.
+   It appears after 75 to 120 ms.
+4. In the `mc.display` child whose `AXDisplayID` equals the `CGDirectDisplayID`
+   of the display, find the button `mc.spaces.add`. Match on the identifier.
+   The description text depends on the language ("add desktop",
+   "adicionar mesa"). With shared Spaces, any display group works.
+5. Send `AXPress` to the button. It returns in 7 to 26 ms.
+6. Poll `SLSCopyManagedDisplaySpaces` every 50 ms (2 s cap) until the display
+   lists a new type-0 Space. It appears 9 to 27 ms after the press. The Dock
+   appends it at the end of `Spaces[]`.
+7. Close Mission Control with the same toggle, only when this call opened it.
+   Poll until the `mc` group is gone (1 s cap). When it stays, post Escape.
+   Then wait 300 ms and until the display does not animate, so a Space switch
+   does not start inside the close animation.
+
+The current Space of the display and the frontmost window do not change. One
+creation takes about 450 to 600 ms. A timeout or an AX error returns nil and
+logs the reason in the `spaces` category.
 
 ## Move window to Space N
 

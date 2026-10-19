@@ -18,6 +18,9 @@ public struct Config: Codable, Equatable {
     /// `horizontal`, `vertical`, or `auto` (longer side of the work area).
     public var rootOrientation: String = "auto"
     public var followOnMove: Bool = false
+    /// When true, `space N` and `move-to-space N` create desktops on the
+    /// display until it has N Spaces. Creation opens Mission Control for a moment.
+    public var createMissingSpaces: Bool = true
     public var spaceSwitch: SpaceSwitch = SpaceSwitch()
     public var floatingApps: [String] = ["com.apple.systempreferences"]
     /// When true, a window without a usable zoom button floats. Settings
@@ -27,7 +30,7 @@ public struct Config: Codable, Equatable {
     public var bindings: [String: String] = Config.defaultBindings
 
     enum CodingKeys: String, CodingKey {
-        case gaps, rootOrientation, followOnMove, spaceSwitch, floatingApps, floatWindowsWithoutZoom, bindings
+        case gaps, rootOrientation, followOnMove, createMissingSpaces, spaceSwitch, floatingApps, floatWindowsWithoutZoom, bindings
     }
 
     public static let defaultBindings: [String: String] = {
@@ -114,6 +117,7 @@ extension Config {
             rootOrientation = o.lowercased()
         }
         followOnMove = try c.decodeIfPresent(Bool.self, forKey: .followOnMove) ?? followOnMove
+        createMissingSpaces = try c.decodeIfPresent(Bool.self, forKey: .createMissingSpaces) ?? createMissingSpaces
         if let s = try c.decodeIfPresent(SpaceSwitch.self, forKey: .spaceSwitch) {
             guard ["auto", "gesture", "ctrl-n"].contains(s.strategy.lowercased()) else {
                 throw DecodingError.dataCorruptedError(

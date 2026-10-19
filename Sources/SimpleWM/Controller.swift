@@ -28,6 +28,7 @@ public final class WMController {
     public private(set) var enabled: Bool = false
 
     public let spaceManager: SpaceManager
+    public let spaceCreator: SpaceCreator
     public let displayManager: DisplayManager
     public let enumerator: WindowEnumerator
     public let observer: WindowObserver
@@ -39,7 +40,8 @@ public final class WMController {
     /// Called when `enabled`, `warning`, or `statusText` can have changed.
     public var onStatusChange: (() -> Void)?
 
-    /// True after a Space switch or a window move failed. A later success clears it.
+    /// True after a Space switch, a Space creation, or a window move failed.
+    /// A later successful switch or move clears it. A successful creation does not touch it.
     public private(set) var lastSwitchFailed: Bool = false
 
     /// True while AeroSpace runs. The timer and app events update it.
@@ -62,7 +64,7 @@ public final class WMController {
     public var statusText: String? {
         if !Permissions.isAccessibilityTrusted() { return "Accessibility not granted" }
         if aerospaceRunning { return "AeroSpace is running: tiling is off" }
-        if lastSwitchFailed { return "Last Space switch or move failed" }
+        if lastSwitchFailed { return "Last Space switch, creation, or move failed" }
         if !enabled { return "Disabled" }
         return nil
     }
@@ -119,6 +121,7 @@ public final class WMController {
                      spaceManager: SpaceManager(
                         switchStrategies: switches,
                         moveStrategies: [BridgedMove(), CompatIDMove(), ManagedSpaceMove()]),
+                     spaceCreator: SpaceCreator(),
                      displayManager: DisplayManager(),
                      enumerator: enumerator,
                      observer: WindowObserver(),
@@ -127,6 +130,7 @@ public final class WMController {
 
     public init(config: Config,
                 spaceManager: SpaceManager,
+                spaceCreator: SpaceCreator,
                 displayManager: DisplayManager,
                 enumerator: WindowEnumerator,
                 observer: WindowObserver,
@@ -134,6 +138,7 @@ public final class WMController {
         self.config = config
         self.state = WMState()
         self.spaceManager = spaceManager
+        self.spaceCreator = spaceCreator
         self.displayManager = displayManager
         self.enumerator = enumerator
         self.observer = observer
@@ -581,17 +586,50 @@ public final class WMController {
             return
         }
         let all = d.spaces
-        guard n >= 1, n <= all.count else {
-            log.info("space \(n, privacy: .public): the display has \(all.count, privacy: .public) Spaces.")
+        guard n >= 1 else { return }
+        let missing = n > all.count
+        if missing {
+            guard canCreateSpaces(upTo: n) else {
+                log.info("space \(n, privacy: .public): the display has \(all.count, privacy: .public) Spaces.")
+                return
+            }
+        } else if all[n - 1].id == d.current.id {
             return
         }
-        if all[n - 1].id == d.current.id { return }
         Task { [weak self] in
             guard let self else { return }
-            let ok = await self.spaceManager.switchTo(userSpace: n, on: d)
+            var display = d
+            if missing {
+                guard let fresh = await self.createMissingSpaces(upTo: n, on: d, what: "space \(n)") else { return }
+                display = fresh
+            }
+            let ok = await self.spaceManager.switchTo(userSpace: n, on: display)
             self.recordSpaceSwitch(ok, what: "space \(n)")
             self.scheduleRefresh()
         }
+    }
+
+    /// True when the app may create Spaces up to `n`: the config allows it
+    /// and `n` is not above the cap of `SpaceManager.maxSpaceCount`.
+    private func canCreateSpaces(upTo n: Int) -> Bool {
+        config.createMissingSpaces && n <= SpaceManager.maxSpaceCount
+    }
+
+    /// Creates desktops on `d` until it has `n` Spaces. Returns the fresh
+    /// snapshot, or nil after a failure. A failure sets the menu bar warning.
+    /// A success does not touch the warning: only the later switch or move does.
+    private func createMissingSpaces(upTo n: Int, on d: DisplaySnapshot, what: String) async -> DisplaySnapshot? {
+        guard let fresh = await spaceManager.ensureSpaces(count: n, on: d, creator: spaceCreator) else {
+            recordSwitch(false, what: what, reason: "The app could not create the missing Spaces.")
+            return nil
+        }
+        let created = spaceManager.lastCreatedSpaceCount
+        log.info("\(what, privacy: .public): created \(created, privacy: .public) Space(s).")
+        guard n <= fresh.spaces.count else {
+            log.error("\(what, privacy: .public): the display has \(fresh.spaces.count, privacy: .public) Spaces after creation.")
+            return nil
+        }
+        return fresh
     }
 
     private func moveToSpace(_ n: Int) {
@@ -614,26 +652,42 @@ public final class WMController {
             return
         }
         let all = d.spaces
-        guard n >= 1, n <= all.count else {
-            log.info("move-to-space \(n, privacy: .public): the display has \(all.count, privacy: .public) Spaces.")
-            return
+        guard n >= 1 else { return }
+        let missing = n > all.count
+        if missing {
+            guard canCreateSpaces(upTo: n) else {
+                log.info("move-to-space \(n, privacy: .public): the display has \(all.count, privacy: .public) Spaces.")
+                return
+            }
+        } else {
+            let target = all[n - 1]
+            guard target.isUser else {
+                log.info("move-to-space \(n, privacy: .public): Space \(n, privacy: .public) is a fullscreen app. Skipped.")
+                return
+            }
+            guard target.id != d.current.id else { return }
         }
-        let target = all[n - 1]
-        guard target.isUser else {
-            log.info("move-to-space \(n, privacy: .public): Space \(n, privacy: .public) is a fullscreen app. Skipped.")
-            return
-        }
-        guard target.id != d.current.id else { return }
         // Read before the move: a refresh can drop the window from its tree
         // while the move runs. The window still has to reach the new tree.
         let wasTiled = state.key(of: w.id) != nil
         let from = state.key(of: w.id) ?? SpaceKey(display: d.id, space: d.current.id)
-        let to = SpaceKey(display: d.id, space: target.id)
         let follow = config.followOnMove
 
         Task { [weak self] in
             guard let self else { return }
-            let ok = await self.spaceManager.move(w.id, toUserSpace: n, on: d)
+            var display = d
+            if missing {
+                guard let fresh = await self.createMissingSpaces(upTo: n, on: d, what: "move-to-space \(n)") else { return }
+                display = fresh
+            }
+            // A created Space goes at the end of the list, so it is a normal desktop.
+            let target = display.spaces[n - 1]
+            guard target.isUser else {
+                self.log.info("move-to-space \(n, privacy: .public): Space \(n, privacy: .public) is a fullscreen app. Skipped.")
+                return
+            }
+            let to = SpaceKey(display: d.id, space: target.id)
+            let ok = await self.spaceManager.move(w.id, toUserSpace: n, on: display)
             self.recordSwitch(ok, what: "move-to-space \(n)")
             guard ok else { return }
             if self.tilingActive, wasTiled {
@@ -643,7 +697,7 @@ public final class WMController {
                 self.state.transfer(w.id, from: from, to: to)
             }
             if follow {
-                let switched = await self.spaceManager.switchTo(userSpace: n, on: d)
+                let switched = await self.spaceManager.switchTo(userSpace: n, on: display)
                 self.recordSpaceSwitch(switched, what: "space \(n)")
                 if switched { w.focus() }
             } else if self.tilingActive, let next = self.state.trees[from]?.focused {
@@ -665,8 +719,8 @@ public final class WMController {
         }
     }
 
-    private func recordSwitch(_ ok: Bool, what: String) {
-        if !ok { log.error("\(what, privacy: .public) failed. No strategy verified.") }
+    private func recordSwitch(_ ok: Bool, what: String, reason: String = "No strategy verified.") {
+        if !ok { log.error("\(what, privacy: .public) failed. \(reason, privacy: .public)") }
         if lastSwitchFailed != !ok {
             lastSwitchFailed = !ok
             onStatusChange?()
