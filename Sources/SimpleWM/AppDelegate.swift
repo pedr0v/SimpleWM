@@ -3,18 +3,21 @@ import LayoutEngine
 import MacOSBridge
 import os
 
-/// Wires the config, the controller, and the menu bar.
+/// Wires the config, the controller, the menu bar, and the updater.
 ///
 /// Startup:
 /// 1. Write the default config when the file is absent. Load the config.
 /// 2. Build the controller and install the menu bar.
-/// 3. Check the Accessibility grant. Without it, show the system prompt and
+/// 3. Start the updater. It probes for a new release 10 s later and every 24 h.
+///    The menu shows "Atualizar (vX.Y.Z)" when a release is newer.
+/// 4. Check the Accessibility grant. Without it, show the system prompt and
 ///    poll every 2 s. Start the controller when the grant arrives.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let log = Logger(subsystem: "com.simplewm.app", category: "app")
     private var controller: WMController!
     private let menuBar = MenuBar()
+    private let updater = Updater()
     private var permissionTimer: Timer?
     /// False after the user disables the app in the menu.
     private var wantsEnabled = true
@@ -41,6 +44,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBar.onReloadConfig = { [weak self] in self?.reloadConfig() }
         menuBar.install()
         updateMenu()
+
+        // The updater runs only inside the app bundle. `.build/debug/SimpleWM` has no update item.
+        updater.onAvailableUpdate = { [weak self] version in
+            self?.menuBar.setAvailableUpdate(version: version)
+        }
+        updater.start()
+        if updater.isRunning {
+            menuBar.onCheckForUpdates = { [weak self] in self?.updater.checkForUpdates() }
+        }
 
         // A dry run never shows the system Accessibility prompt.
         startWhenTrusted(prompt: !dryRun)

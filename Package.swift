@@ -9,6 +9,10 @@ let package = Package(
         .library(name: "MacOSBridge", targets: ["MacOSBridge"]),
         .executable(name: "SimpleWM", targets: ["SimpleWM"]),
     ],
+    dependencies: [
+        // Auto-update. The version is exact so that local and CI builds match.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
+    ],
     targets: [
         // Pure tiling logic. Foundation only. No AppKit, no CoreGraphics.
         .target(name: "LayoutEngine"),
@@ -22,10 +26,14 @@ let package = Package(
                 .linkedFramework("Carbon"),
             ]
         ),
-        // Menu-bar executable. Wires config, controller, and status item.
+        // Menu-bar executable. Wires config, controller, status item, and updater.
         .executableTarget(
             name: "SimpleWM",
-            dependencies: ["LayoutEngine", "MacOSBridge"]
+            dependencies: [
+                "LayoutEngine",
+                "MacOSBridge",
+                .product(name: "Sparkle", package: "Sparkle"),
+            ]
         ),
         .testTarget(name: "LayoutEngineTests", dependencies: ["LayoutEngine"]),
     ],
