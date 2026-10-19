@@ -16,8 +16,9 @@ with `dlsym`.
 ## Decisions
 
 1. Spaces are native. The app never emulates workspaces.
-2. `N` in `space N` counts only type-0 Spaces on the target display.
-   Fullscreen Spaces (type 4) never count. The app never creates a Space.
+2. `N` in `space N` indexes all Spaces of the target display in `Spaces[]`
+   order, which is the Mission Control order. A fullscreen Space counts.
+   `move-to-space N` only accepts a type-0 target. The app never creates a Space.
 3. The app never calls `SLSManagedDisplaySetCurrentSpace`. Yabai calls it
    only inside the Dock.
 4. Target display for `space N`: display of the focused window, then the
@@ -56,7 +57,8 @@ Verification polls `SLSManagedDisplayGetCurrentSpace` every 30 ms. The wait is
 
 ## Move window to Space N
 
-Target is the Nth type-0 Space of the window's display. The app refuses to
+Target is the Nth Space of the window's display in Mission Control order.
+It must be a type-0 Space. The app refuses to
 move a native fullscreen window, and it refuses when the display shows a
 fullscreen Space. Strategies in order, each verified with
 `SLSCopySpacesForWindows` (800 ms for `BridgedMove`, 500 ms for the others):

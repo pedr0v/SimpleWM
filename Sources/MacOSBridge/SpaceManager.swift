@@ -39,7 +39,8 @@ public struct DisplaySnapshot: Equatable, Sendable {
         self.current = current
     }
 
-    /// Only type-0 Spaces, in order. Option+N indexes this list (1-based).
+    /// Only type-0 Spaces, in order. Tiling uses this list.
+    /// `space N` indexes `spaces` (all Spaces, Mission Control order).
     public var userSpaces: [SpaceInfo] { spaces.filter(\.isUser) }
 }
 
@@ -423,12 +424,12 @@ public final class SpaceManager {
     private func performSwitch(userSpace n: Int, on display: DisplaySnapshot) async -> SpaceSwitchOutcome {
         // Read a fresh snapshot: the caller's snapshot can be old.
         let fresh = displays().first { $0.id == display.id } ?? display
-        let users = fresh.userSpaces
-        guard n >= 1, n <= users.count else {
-            log.info("Space \(n) does not exist on \(fresh.id.uuid, privacy: .public) (\(users.count) user Spaces)")
+        let all = fresh.spaces
+        guard n >= 1, n <= all.count else {
+            log.info("Space \(n) does not exist on \(fresh.id.uuid, privacy: .public) (\(all.count) Spaces)")
             return .outOfRange
         }
-        let target = users[n - 1].id
+        let target = all[n - 1].id
         if currentSpace(of: fresh.id) == target { return .alreadyCurrent }
 
         let ordered = orderedSwitchStrategies()
@@ -470,12 +471,12 @@ public final class SpaceManager {
     /// Returns true without a move when `w` is already on the target.
     public func move(_ w: WindowID, toUserSpace n: Int, on display: DisplaySnapshot) async -> Bool {
         let fresh = displays().first { $0.id == display.id } ?? display
-        let users = fresh.userSpaces
-        guard n >= 1, n <= users.count else {
-            log.info("Space \(n) does not exist on \(fresh.id.uuid, privacy: .public); window \(w.description, privacy: .public) stays")
+        let all = fresh.spaces
+        guard n >= 1, n <= all.count, all[n - 1].isUser else {
+            log.info("Space \(n) is not a normal desktop on \(fresh.id.uuid, privacy: .public); window \(w.description, privacy: .public) stays")
             return false
         }
-        let target = users[n - 1].id
+        let target = all[n - 1].id
         if spaces(of: w).contains(target) { return true }
 
         for strategy in orderedMoveStrategies() where strategy.isAvailable() {

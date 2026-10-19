@@ -77,9 +77,10 @@ warning is active, the first menu row shows the reason.
 | `alt-shift-equal` | `resize 0.05` | Make the window larger. |
 | `alt-shift-space` | `toggle-float` | Toggle the focused window between tiled and floating. |
 
-`N` counts only normal Spaces of the display. Fullscreen app Spaces do not
-count. The app never creates a Space. If Space N does not exist, the key
-does nothing.
+`N` follows the Mission Control order of the focused display. A fullscreen
+app counts as one Space. `move-to-space N` only targets a normal desktop.
+The app never creates a Space. If Space N does not exist, the key does
+nothing.
 
 Key codes are physical. The keyboard layout (for example ABNT2) does not
 change the bindings.
@@ -110,8 +111,8 @@ Config" to apply it.
   "floatWindowsWithoutZoom" : true,
   "followOnMove" : false,
   "gaps" : {
-    "inner" : 8,
-    "outer" : 8
+    "inner" : 0,
+    "outer" : 0
   },
   "rootOrientation" : "auto",
   "spaceSwitch" : {

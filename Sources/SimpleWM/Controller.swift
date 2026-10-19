@@ -580,12 +580,12 @@ public final class WMController {
             log.error("space \(n, privacy: .public): no display found.")
             return
         }
-        let user = d.userSpaces
-        guard n >= 1, n <= user.count else {
-            log.info("space \(n, privacy: .public): the display has \(user.count, privacy: .public) Spaces.")
+        let all = d.spaces
+        guard n >= 1, n <= all.count else {
+            log.info("space \(n, privacy: .public): the display has \(all.count, privacy: .public) Spaces.")
             return
         }
-        if user[n - 1].id == d.current.id { return }
+        if all[n - 1].id == d.current.id { return }
         Task { [weak self] in
             guard let self else { return }
             let ok = await self.spaceManager.switchTo(userSpace: n, on: d)
@@ -613,12 +613,16 @@ public final class WMController {
             log.info("move-to-space \(n, privacy: .public): native fullscreen Space or window. Skipped.")
             return
         }
-        let user = d.userSpaces
-        guard n >= 1, n <= user.count else {
-            log.info("move-to-space \(n, privacy: .public): the display has \(user.count, privacy: .public) Spaces.")
+        let all = d.spaces
+        guard n >= 1, n <= all.count else {
+            log.info("move-to-space \(n, privacy: .public): the display has \(all.count, privacy: .public) Spaces.")
             return
         }
-        let target = user[n - 1]
+        let target = all[n - 1]
+        guard target.isUser else {
+            log.info("move-to-space \(n, privacy: .public): Space \(n, privacy: .public) is a fullscreen app. Skipped.")
+            return
+        }
         guard target.id != d.current.id else { return }
         // Read before the move: a refresh can drop the window from its tree
         // while the move runs. The window still has to reach the new tree.

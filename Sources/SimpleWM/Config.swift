@@ -14,7 +14,7 @@ public struct Config: Codable, Equatable {
         public var warpCursor: Bool = true
     }
 
-    public var gaps: Gaps = Gaps(inner: 8, outer: 8)
+    public var gaps: Gaps = Gaps(inner: 0, outer: 0)
     /// `horizontal`, `vertical`, or `auto` (longer side of the work area).
     public var rootOrientation: String = "auto"
     public var followOnMove: Bool = false
