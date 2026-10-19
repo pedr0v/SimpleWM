@@ -86,14 +86,33 @@ public struct AXWindow {
         return WindowEnumerator.isOnScreenLayerZero(id)
     }
 
+    /// Answer of the AX checks. `unknown` means that an AX read timed out or
+    /// failed, so the window can still be tileable.
+    enum AXTileability {
+        case yes, no, unknown
+    }
+
     /// The AX part of `isTileable`. `WindowEnumerator` checks the
     /// on-screen part once for all windows.
-    var isTileableByAX: Bool {
-        guard pid != getpid(), id.raw != 0 else { return false }
-        guard subrole == (kAXStandardWindowSubrole as String) else { return false }
-        guard !isMinimized, !isFullscreen else { return false }
-        return AXHelper.isSettable(element, kAXPositionAttribute)
-            && AXHelper.isSettable(element, kAXSizeAttribute)
+    var isTileableByAX: Bool { tileabilityByAX == .yes }
+
+    /// Like `isTileableByAX`, but tells a timeout apart from a real no.
+    var tileabilityByAX: AXTileability {
+        guard pid != getpid(), id.raw != 0 else { return .no }
+        let role = AXHelper.read(element, kAXSubroleAttribute)
+        if AXHelper.isTransient(role.status) { return .unknown }
+        guard (role.value as? String) == (kAXStandardWindowSubrole as String) else { return .no }
+        let minimized = AXHelper.read(element, kAXMinimizedAttribute)
+        if AXHelper.isTransient(minimized.status) { return .unknown }
+        if (minimized.value as? NSNumber)?.boolValue == true { return .no }
+        let fullscreen = AXHelper.read(element, AXNames.fullScreen)
+        if AXHelper.isTransient(fullscreen.status) { return .unknown }
+        if (fullscreen.value as? NSNumber)?.boolValue == true { return .no }
+        for attribute in [kAXPositionAttribute, kAXSizeAttribute] {
+            guard let settable = AXHelper.settable(element, attribute) else { return .unknown }
+            if !settable { return .no }
+        }
+        return .yes
     }
 
     public var isMinimized: Bool { AXHelper.bool(element, kAXMinimizedAttribute) ?? false }
@@ -110,6 +129,37 @@ enum AXHelper {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
         return value
+    }
+
+    /// Reads one attribute and keeps the AX status. A timeout shows as
+    /// `.cannotComplete`.
+    static func read(_ element: AXUIElement, _ attribute: String) -> (value: CFTypeRef?, status: AXError) {
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        return (status == .success ? value : nil, status)
+    }
+
+    /// True for a status that says "ask again later": the app timed out or
+    /// the call failed. A real answer such as `.attributeUnsupported` is not
+    /// transient.
+    static func isTransient(_ status: AXError) -> Bool {
+        status == .cannotComplete || status == .failure
+    }
+
+    /// Whether `attribute` is settable. Returns nil when the read timed out.
+    static func settable(_ element: AXUIElement, _ attribute: String) -> Bool? {
+        var settable: DarwinBoolean = false
+        let status = AXUIElementIsAttributeSettable(element, attribute as CFString, &settable)
+        if isTransient(status) { return nil }
+        return status == .success && settable.boolValue
+    }
+
+    /// The AX elements in an attribute value that `read` returned.
+    static func elementList(_ value: CFTypeRef?) -> [AXUIElement] {
+        guard let value, let array = value as? [AnyObject] else { return [] }
+        return array.compactMap { item in
+            CFGetTypeID(item) == AXUIElementGetTypeID() ? (item as! AXUIElement) : nil
+        }
     }
 
     static func string(_ element: AXUIElement, _ attribute: String) -> String? {
@@ -158,10 +208,12 @@ enum AXHelper {
         return settable.boolValue
     }
 
-    /// `CGWindowID` of a window element, or nil.
+    /// `CGWindowID` of a window element, or nil. Returns nil when the private
+    /// symbol is absent (the loader logs that once).
     static func windowID(_ element: AXUIElement) -> WindowID? {
+        guard let getWindow = SkyLight.shared.axUIElementGetWindow else { return nil }
         var wid: UInt32 = 0
-        guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else { return nil }
+        guard getWindow(element, &wid) == .success, wid != 0 else { return nil }
         return WindowID(wid)
     }
 
@@ -184,6 +236,12 @@ public final class WindowEnumerator {
 
     private let log = Logger(subsystem: "com.simplewm.app", category: "windows")
 
+    /// Windows that the last `tileableWindows()` call could not judge. They
+    /// are on screen at layer 0, but an AX read timed out or failed (a hung
+    /// app). The caller keeps such windows in its tree instead of treating
+    /// them as closed.
+    public private(set) var uncertainWindowIDs: Set<WindowID> = []
+
     public init(floatingBundleIDs: Set<String> = []) {
         self.floatingBundleIDs = floatingBundleIDs
         // Global default for elements without their own timeout (default is 6 s).
@@ -195,11 +253,20 @@ public final class WindowEnumerator {
     ///
     /// Only windows that `CGWindowListCopyWindowInfo` reports on screen at
     /// layer 0 qualify. Apps without such a window get no AX call.
+    ///
+    /// A window that fails an AX read with a timeout goes to
+    /// `uncertainWindowIDs`, not to the result. So does every on-screen window
+    /// of an app whose window list timed out.
     public func tileableWindows() -> [AXWindow] {
         let onScreen = Self.onScreenLayerZero()
-        guard !onScreen.ids.isEmpty else { return [] }
+        guard !onScreen.ids.isEmpty else {
+            uncertainWindowIDs = []
+            return []
+        }
         let me = getpid()
         var result: [AXWindow] = []
+        var uncertainPIDs = Set<pid_t>()
+        var uncertain = Set<WindowID>()
         for app in NSWorkspace.shared.runningApplications {
             let pid = app.processIdentifier
             guard pid != me, pid > 0, !app.isTerminated,
@@ -209,14 +276,59 @@ public final class WindowEnumerator {
             let bundleID = app.bundleIdentifier
             if let bundleID, floatingBundleIDs.contains(bundleID) { continue }
             let appElement = AXHelper.appElement(pid)
-            for element in AXHelper.elements(appElement, kAXWindowsAttribute) {
+            let list = AXHelper.read(appElement, kAXWindowsAttribute)
+            guard list.status == .success else {
+                if AXHelper.isTransient(list.status) { uncertainPIDs.insert(pid) }
+                continue
+            }
+            for element in AXHelper.elementList(list.value) {
                 guard let wid = AXHelper.windowID(element), onScreen.ids.contains(wid) else { continue }
                 AXUIElementSetMessagingTimeout(element, AXHelper.appTimeout)
                 let window = AXWindow(id: wid, pid: pid, element: element, bundleID: bundleID)
-                if window.isTileableByAX { result.append(window) }
+                switch window.tileabilityByAX {
+                case .yes: result.append(window)
+                case .no: break
+                case .unknown: uncertain.insert(wid)
+                }
             }
         }
+        for (wid, owner) in onScreen.owners where uncertainPIDs.contains(owner) {
+            uncertain.insert(wid)
+        }
+        uncertainWindowIDs = uncertain
+        if !uncertain.isEmpty {
+            log.debug("AX could not judge \(uncertain.count, privacy: .public) on-screen window(s).")
+        }
         return result
+    }
+
+    /// Frontmost on-screen layer-0 window whose center lies inside `frame`
+    /// (AX coordinates), or nil. Works for windows that are not tileable, for
+    /// example the window of a native fullscreen Space. Skips our own windows.
+    public func topWindow(in frame: Rect) -> AXWindow? {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return nil }
+        let me = getpid()
+        // The list runs from the front window to the back window.
+        for info in list {
+            guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let number = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, pid != me,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  rect.width >= 50, rect.height >= 50,
+                  frame.contains(x: Double(rect.midX), y: Double(rect.midY))
+            else { continue }
+            let wid = WindowID(number)
+            let app = NSRunningApplication(processIdentifier: pid)
+            guard app?.activationPolicy == .regular else { continue }
+            let appElement = AXHelper.appElement(pid)
+            for element in AXHelper.elements(appElement, kAXWindowsAttribute) where AXHelper.windowID(element) == wid {
+                AXUIElementSetMessagingTimeout(element, AXHelper.appTimeout)
+                return AXWindow(id: wid, pid: pid, element: element, bundleID: app?.bundleIdentifier)
+            }
+        }
+        return nil
     }
 
     /// Focused window of the frontmost app, or nil.
@@ -238,23 +350,26 @@ public final class WindowEnumerator {
     }
 
     /// On-screen layer-0 window IDs and their owner pids.
-    nonisolated static func onScreenLayerZero() -> (ids: Set<WindowID>, pids: Set<pid_t>) {
+    nonisolated static func onScreenLayerZero() -> (ids: Set<WindowID>, pids: Set<pid_t>, owners: [WindowID: pid_t]) {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
-            return ([], [])
+            return ([], [], [:])
         }
         var ids = Set<WindowID>()
         var pids = Set<pid_t>()
+        var owners: [WindowID: pid_t] = [:]
         for info in list {
             guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                   let number = info[kCGWindowNumber as String] as? NSNumber
             else { continue }
-            ids.insert(WindowID(number.uint32Value))
+            let wid = WindowID(number.uint32Value)
+            ids.insert(wid)
             if let owner = info[kCGWindowOwnerPID as String] as? NSNumber {
                 pids.insert(pid_t(owner.int32Value))
+                owners[wid] = pid_t(owner.int32Value)
             }
         }
-        return (ids, pids)
+        return (ids, pids, owners)
     }
 
     /// True when `CGWindowListCopyWindowInfo(.optionIncludingWindow)` reports

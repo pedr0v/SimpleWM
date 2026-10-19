@@ -41,20 +41,29 @@ public struct Container: Equatable, Sendable {
 /// - Insert: the new leaf goes right after the focused leaf, in the same
 ///   container. It takes half the weight of the focused leaf. With no focused
 ///   leaf, the new leaf goes at the end of the root.
-/// - Remove: the leaf leaves its container. A non-root container with one
-///   child collapses: the child takes the container slot and weight. No other
-///   auto-flatten happens.
+/// - Remove: the leaf leaves its container. Its weight goes to the previous
+///   sibling (the next sibling for the first child). So remove undoes insert.
+///   A non-root container with one child collapses: the child takes the
+///   container slot and weight. When the child is a container with the
+///   orientation of the grandparent, its children join the grandparent
+///   (i3 flatten). A root with one wrapper of one leaf takes the wrapper
+///   orientation and holds the leaf.
+/// - Reconcile: one new window follows the insert rule. Two or more new
+///   windows in one call get the mean weight of their container. The result
+///   is equal sizes, not a halving cascade.
 /// - Focus(d): climb to the nearest ancestor whose orientation equals
 ///   `d.orientation` and that has a sibling on side `d`. Descend into that
 ///   sibling by `mru`. No match returns nil (the app then tries the next display).
 ///   Focus never wraps.
 /// - Move(d): same climb. At the leaf parent, a sibling leaf swaps places
-///   and a sibling container receives the leaf at its near edge. At a higher
-///   ancestor, the leaf goes next to its old branch, on side `d`. When no
-///   ancestor matches, the root takes orientation `d.orientation`, the old
-///   root children go into a new container, and the leaf goes on side `d`.
-///   At the root edge the move fails and returns false (the app then tries
-///   the next display).
+///   and a sibling container receives the leaf. A container with orientation
+///   `d.orientation` takes the leaf at its near edge. A container with the
+///   other orientation takes the leaf after its most recent child (i3).
+///   At a higher ancestor, the leaf goes next to its old branch, on side `d`.
+///   A move that changes nothing does not count. When no ancestor matches,
+///   the root takes orientation `d.orientation`, the old root children go
+///   into a new container, and the leaf goes on side `d`. At the root edge
+///   the move fails and returns false (the app then tries the next display).
 /// - toggleSplit: flips the orientation of the parent of the focused leaf.
 /// - split(o): wraps the focused leaf in a new container with orientation `o`.
 ///   The new container takes the leaf's slot and weight.
@@ -104,14 +113,26 @@ public struct TilingTree: Equatable, Sendable {
     /// Inserts `w` after the focused leaf. See type rules. Does nothing when
     /// `w` is already present. The new window becomes focused.
     public mutating func insert(_ w: WindowID) {
+        insert(w, equalWeight: false)
+    }
+
+    /// Inserts `w` after the focused leaf, like `insert(_:)`. With
+    /// `equalWeight` true, the new leaf gets the mean weight of its container
+    /// and no weight changes on the focused leaf. Use it for windows that
+    /// arrive together.
+    public mutating func insert(_ w: WindowID, equalWeight: Bool) {
         guard !contains(w) else { return }
         let id = makeID()
         nodes[id] = .window(w)
         if let f = focused, let leaf = leafID(of: f), let p = parents[leaf],
            let c = container(p), let i = c.children.firstIndex(of: leaf) {
-            let half = c.weights[i] / 2
-            modifyContainer(p) { $0.weights[i] = half }
-            attach(id, to: p, at: i + 1, weight: half)
+            if equalWeight {
+                attach(id, to: p, at: i + 1, weight: Self.equalShare(c.weights))
+            } else {
+                let half = c.weights[i] / 2
+                modifyContainer(p) { $0.weights[i] = half }
+                attach(id, to: p, at: i + 1, weight: half)
+            }
         } else {
             let c = container(root) ?? Container(orientation: .horizontal)
             attach(id, to: root, at: c.children.count, weight: Self.equalShare(c.weights))
@@ -126,9 +147,11 @@ public struct TilingTree: Equatable, Sendable {
         let wasFocused = focused == w
         let next = wasFocused ? focusCandidate(replacing: leaf) : nil
         if zoomed == w { zoomed = nil }
+        giveWeightToSibling(of: leaf)
         guard let info = detach(leaf) else { return }
         nodes[leaf] = nil
         normalize(info.parent)
+        collapseRootWrapper()
         if wasFocused {
             focused = nil
             if let next { setFocus(next) }
@@ -138,13 +161,20 @@ public struct TilingTree: Equatable, Sendable {
     /// Makes the tree match `present`: removes missing windows, inserts new
     /// windows (in list order, each after the focused leaf). Keeps the order
     /// of windows that stay.
+    ///
+    /// One new window follows the insert rule (half the weight of the focused
+    /// leaf). Two or more new windows get the mean weight of their container,
+    /// so they do not shrink each other.
     public mutating func reconcile(present: [WindowID]) {
         let keep = Set(present)
         for w in windows where !keep.contains(w) {
             remove(w)
         }
-        for w in present where !contains(w) {
-            insert(w)
+        var seen = Set<WindowID>()
+        let added = present.filter { !contains($0) && seen.insert($0).inserted }
+        let together = added.count > 1
+        for w in added {
+            insert(w, equalWeight: together)
         }
     }
 
@@ -186,9 +216,11 @@ public struct TilingTree: Equatable, Sendable {
     /// The engine climbs from the leaf to the nearest ancestor whose
     /// orientation equals `d.orientation`:
     /// - At the leaf parent, a sibling leaf on side `d` swaps places with the
-    ///   leaf. A sibling container on side `d` receives the leaf at its near edge.
+    ///   leaf. A sibling container on side `d` receives the leaf: at its near
+    ///   edge when it has orientation `d.orientation`, else after its most
+    ///   recent child.
     /// - At a higher ancestor, the leaf goes next to the child that held it,
-    ///   on side `d`.
+    ///   on side `d`. A move that changes nothing is skipped.
     /// - With no match, the root takes orientation `d.orientation`. The old
     ///   root children go into a new container. The leaf goes on side `d`.
     ///   When the root has one child, the root only flips.
@@ -205,7 +237,14 @@ public struct TilingTree: Equatable, Sendable {
                     if c.children.indices.contains(j) {
                         let sibling = c.children[j]
                         if let sc = container(sibling) {
-                            let at = d.isForward ? 0 : sc.children.count
+                            let at: Int
+                            if sc.orientation == d.orientation {
+                                at = d.isForward ? 0 : sc.children.count
+                            } else {
+                                // A near edge means nothing on the other axis.
+                                // Enter after the most recent child (i3).
+                                at = min((sc.mru.first ?? 0) + 1, sc.children.count)
+                            }
                             _ = detach(leaf)
                             attach(leaf, to: sibling, at: at, weight: Self.equalShare(sc.weights))
                             normalize(p)
@@ -215,7 +254,7 @@ public struct TilingTree: Equatable, Sendable {
                         setFocus(f)
                         return true
                     }
-                } else {
+                } else if !(c.children.count == 1 && holdsOnly(leaf, below: child)) {
                     guard let old = detach(leaf) else { return false }
                     guard let k = container(p)?.children.firstIndex(of: child) else { return false }
                     let pc = container(p) ?? c
@@ -224,6 +263,7 @@ public struct TilingTree: Equatable, Sendable {
                     setFocus(f)
                     return true
                 }
+                // Else the move changes nothing. Keep climbing.
             }
             child = p
         }
@@ -403,7 +443,9 @@ extension TilingTree {
 
     /// Applies the collapse rules to container `id` after it lost a child.
     /// An empty non-root container disappears. A non-root container with one
-    /// child gives its slot and weight to that child.
+    /// child gives its slot and weight to that child. When that child is a
+    /// container with the orientation of the grandparent, its children join
+    /// the grandparent (i3 flatten).
     private mutating func normalize(_ id: NodeID) {
         guard id != root, let c = container(id), let gp = parents[id] else { return }
         if c.children.isEmpty {
@@ -412,12 +454,85 @@ extension TilingTree {
             normalize(gp)
         } else if c.children.count == 1 {
             let only = c.children[0]
-            guard let gi = container(gp)?.children.firstIndex(of: id) else { return }
+            guard let gc = container(gp), let gi = gc.children.firstIndex(of: id) else { return }
             modifyContainer(gp) { $0.children[gi] = only }
             parents[only] = gp
             parents[id] = nil
             nodes[id] = nil
+            if let oc = container(only), oc.orientation == gc.orientation {
+                splice(only, in: gp)
+            }
         }
+    }
+
+    /// Replaces container `id` by its children inside `parent`. The children
+    /// share the slot weight of `id`. The `mru` order of both containers stays.
+    private mutating func splice(_ id: NodeID, in parent: NodeID) {
+        guard let inner = container(id), let pc = container(parent),
+              let gi = pc.children.firstIndex(of: id), !inner.children.isEmpty else { return }
+        let k = inner.children.count
+        let slot = pc.weights[gi]
+        let total = inner.weights.reduce(0, +)
+        let shares = total > 0
+            ? inner.weights.map { $0 * slot / total }
+            : Array(repeating: slot / Double(k), count: k)
+        modifyContainer(parent) { c in
+            c.children.replaceSubrange(gi...gi, with: inner.children)
+            c.weights.replaceSubrange(gi...gi, with: shares)
+            var ranks: [Int] = []
+            for m in c.mru {
+                if m == gi {
+                    ranks.append(contentsOf: inner.mru.map { $0 + gi })
+                } else if m > gi {
+                    ranks.append(m + k - 1)
+                } else {
+                    ranks.append(m)
+                }
+            }
+            c.mru = ranks
+        }
+        for child in inner.children { parents[child] = parent }
+        parents[id] = nil
+        nodes[id] = nil
+    }
+
+    /// Adds the weight of `child` to its previous sibling, or to its next
+    /// sibling when `child` comes first. This undoes the weight split of
+    /// `insert`. Call it before `detach`.
+    private mutating func giveWeightToSibling(of child: NodeID) {
+        guard let p = parents[child], let c = container(p), c.children.count >= 2,
+              let i = c.children.firstIndex(of: child) else { return }
+        let j = i > 0 ? i - 1 : i + 1
+        modifyContainer(p) { $0.weights[j] += $0.weights[i] }
+    }
+
+    /// A root with one child, where that child is a container with one leaf,
+    /// has no use. The root takes the orientation of the wrapper and holds the
+    /// leaf. This keeps `moveFocused` from reporting a move that does nothing.
+    private mutating func collapseRootWrapper() {
+        while let rc = container(root), rc.children.count == 1,
+              let inner = container(rc.children[0]), inner.children.count == 1 {
+            let wrapper = rc.children[0]
+            let only = inner.children[0]
+            modifyContainer(root) { c in
+                c.children[0] = only
+                c.orientation = inner.orientation
+            }
+            parents[only] = root
+            parents[wrapper] = nil
+            nodes[wrapper] = nil
+        }
+    }
+
+    /// True when the subtree at `id` holds only the leaf `leaf`, through a
+    /// chain of containers with one child each.
+    private func holdsOnly(_ leaf: NodeID, below id: NodeID) -> Bool {
+        var current = id
+        while current != leaf {
+            guard let c = container(current), c.children.count == 1 else { return false }
+            current = c.children[0]
+        }
+        return true
     }
 
     /// Swaps two children of `parent`. Weights and `mru` ranks move with the nodes.
@@ -480,6 +595,12 @@ extension TilingTree {
             attach(wrapper, to: root, at: 0, weight: 1)
         } else {
             modifyContainer(root) { $0.orientation = d.orientation }
+            // The one child can be a container with the new root orientation.
+            // Splice it, so the root does not hold a same-orientation child.
+            if let only = container(root)?.children.first, let oc = container(only),
+               oc.orientation == d.orientation {
+                splice(only, in: root)
+            }
         }
         let now = container(root) ?? rc
         attach(leaf, to: root, at: d.isForward ? now.children.count : 0, weight: Self.equalShare(now.weights))

@@ -292,19 +292,51 @@ final class TilingTreeTests: XCTestCase {
         XCTAssertEqual(t.focused, w(2))
     }
 
-    func testMoveIntoSiblingContainerAtNearEdge() {
+    func testMoveIntoSiblingContainerOnOtherAxisGoesAfterMruChild() {
         var t = tree(1, 2)
         t.split(.vertical)
         t.insert(w(3))
-        // H[1, V[2, 3]]
+        // H[1, V[2, 3]], mru of V picks 3.
         t.setFocus(w(1))
         XCTAssertTrue(t.moveFocused(.right))
-        XCTAssertEqual(order(t), [1, 2, 3])
+        XCTAssertEqual(order(t), [2, 3, 1])
         XCTAssertEqual(t.parentContainer(of: w(1))?.orientation, .vertical)
         XCTAssertEqual(t.focused, w(1))
-        // Root keeps one child: V[1, 2, 3].
+        // Root keeps one child: V[2, 3, 1].
         XCTAssertEqual(t.container(t.root)?.children.count, 1)
         assertConsistent(t)
+
+        var u = tree(1, 2)
+        u.split(.vertical)
+        u.insert(w(3))
+        u.setFocus(w(2))
+        u.setFocus(w(1))
+        XCTAssertTrue(u.moveFocused(.right))
+        XCTAssertEqual(order(u), [2, 1, 3], "mru picks 2")
+        assertConsistent(u)
+    }
+
+    func testMoveIntoSiblingContainerOnOtherAxisIsSymmetric() {
+        // The entry point does not depend on the direction. Both moves land
+        // after the most recent child of the container.
+        var right = tree(1, 2)
+        right.split(.vertical)
+        right.insert(w(3))
+        right.setFocus(w(2))
+        right.setFocus(w(1))
+        XCTAssertTrue(right.moveFocused(.right))
+
+        var left = tree(1, 2)
+        left.setFocus(w(1))
+        left.split(.vertical)
+        left.insert(w(4))
+        // H[V[1, 4], 2]
+        left.setFocus(w(1))
+        left.setFocus(w(2))
+        XCTAssertTrue(left.moveFocused(.left))
+        XCTAssertEqual(order(left), [1, 2, 4], "2 enters after the mru child 1")
+        XCTAssertEqual(order(right), [2, 1, 3])
+        assertConsistent(left)
     }
 
     func testMoveIntoSiblingContainerFromRight() {
@@ -525,6 +557,250 @@ final class TilingTreeTests: XCTestCase {
         t.resize(delta: 0.2)
         XCTAssertEqual(t, before)
     }
+
+    // MARK: Insert and remove are inverses
+
+    func testRemoveUndoesInsertWeights() {
+        var t = tree(1, 2)
+        let before = frames(t)
+        for _ in 0..<3 {
+            t.insert(w(3))
+            XCTAssertEqual(frames(t)[w(2)]?.w, 250)
+            t.remove(w(3))
+            XCTAssertEqual(frames(t), before, "window 2 gets its half back")
+        }
+        XCTAssertEqual(t.focused, w(2))
+        assertConsistent(t)
+    }
+
+    func testRemoveGivesWeightToPreviousSiblingOrNextForFirst() {
+        var t = tree(1, 2, 3)
+        // Weights 0.5, 0.25, 0.25. Remove 2: window 1 takes 0.25.
+        t.remove(w(2))
+        XCTAssertEqual(t.weight(of: w(1)), 0.75)
+        XCTAssertEqual(t.weight(of: w(3)), 0.25)
+        // Remove 1 (first child): window 3 takes its weight.
+        t.remove(w(1))
+        XCTAssertEqual(t.weight(of: w(3)), 1.0)
+        assertConsistent(t)
+    }
+
+    func testRemoveInsertChurnKeepsLayoutStable() {
+        var t = tree(1, 2, 3)
+        t.setFocus(w(2))
+        let before = frames(t)
+        for _ in 0..<5 {
+            t.setFocus(w(2))
+            t.insert(w(9))
+            t.remove(w(9))
+            t.setFocus(w(2))
+        }
+        XCTAssertEqual(frames(t), before)
+    }
+
+    // MARK: Bulk reconcile
+
+    func testReconcileManyNewWindowsGetEqualShares() {
+        var t = TilingTree(root: .horizontal)
+        t.reconcile(present: (1...6).map { w(UInt32($0)) })
+        XCTAssertEqual(order(t), [1, 2, 3, 4, 5, 6])
+        let wide = Rect(x: 0, y: 0, w: 1512, h: 949)
+        let f = t.layout(in: wide, gaps: Gaps(inner: 8, outer: 8))
+        let widths = (1...6).map { f[w(UInt32($0))]!.w }
+        // Free width is 1496 - 40 = 1456. Each window gets about 242.7 pt.
+        XCTAssertTrue(widths.allSatisfy { abs($0 - 243) <= 1 }, "\(widths)")
+        assertConsistent(t)
+    }
+
+    func testReconcileTwoNewWindowsMakeQuarters() {
+        var t = tree(1, 2)
+        t.reconcile(present: [w(1), w(2), w(3), w(4)])
+        XCTAssertEqual(frames(t).values.map(\.w).sorted(), [250, 250, 250, 250])
+        assertConsistent(t)
+    }
+
+    func testReconcileOneNewWindowKeepsHalfRule() {
+        var t = tree(1, 2)
+        t.reconcile(present: [w(1), w(2), w(3)])
+        XCTAssertEqual(frames(t)[w(2)]?.w, 250)
+        XCTAssertEqual(frames(t)[w(3)]?.w, 250)
+        XCTAssertEqual(frames(t)[w(1)]?.w, 500)
+    }
+
+    func testReconcileIgnoresDuplicateIDsInList() {
+        var t = TilingTree(root: .horizontal)
+        t.reconcile(present: [w(1), w(1), w(2)])
+        XCTAssertEqual(order(t), [1, 2])
+        assertConsistent(t)
+    }
+
+    func testInsertEqualWeightKeepsFocusedWeight() {
+        var t = tree(1, 2)
+        t.setFocus(w(1))
+        t.insert(w(3), equalWeight: true)
+        XCTAssertEqual(order(t), [1, 3, 2])
+        XCTAssertEqual(t.weight(of: w(1)), 0.5)
+        XCTAssertEqual(t.weight(of: w(3)), 0.5)
+        XCTAssertEqual(t.focused, w(3))
+    }
+
+    // MARK: Flatten
+
+    /// Builds H[1, V[2, H[3, 4]]] with focus on 4.
+    private func deepNested() -> TilingTree {
+        var t = tree(1, 2)
+        t.split(.vertical)
+        t.insert(w(3))
+        t.split(.horizontal)
+        t.insert(w(4))
+        return t
+    }
+
+    func testRemoveFlattensSameOrientationNesting() {
+        var t = deepNested()
+        XCTAssertEqual(order(t), [1, 2, 3, 4])
+        t.remove(w(2))
+        // H[1, H[3, 4]] becomes H[1, 3, 4].
+        XCTAssertEqual(order(t), [1, 3, 4])
+        XCTAssertEqual(t.container(t.root)?.children.count, 3)
+        XCTAssertEqual(t.parents[t.leafID(of: w(3))!], t.root)
+        XCTAssertEqual(t.parents[t.leafID(of: w(4))!], t.root)
+        // The spliced windows keep the slot of the old container.
+        XCTAssertEqual(t.weight(of: w(1)), 0.5)
+        XCTAssertEqual((t.weight(of: w(3)) ?? 0) + (t.weight(of: w(4)) ?? 0), 0.5, accuracy: 1e-9)
+        t.balance()
+        let widths = [1, 3, 4].map { frames(t)[w(UInt32($0))]!.w }
+        XCTAssertEqual(widths, [333, 334, 333], "thirds")
+        assertConsistent(t)
+    }
+
+    func testMoveAfterFlattenNeedsOnePress() {
+        var t = deepNested()
+        t.remove(w(2))
+        t.setFocus(w(3))
+        XCTAssertTrue(t.moveFocused(.left))
+        XCTAssertEqual(order(t), [3, 1, 4], "3 swaps with 1")
+        assertConsistent(t)
+    }
+
+    func testFlattenKeepsMruOrder() {
+        var t = deepNested()
+        // Focus order: 3 last, then 1.
+        t.setFocus(w(4))
+        t.setFocus(w(3))
+        t.setFocus(w(1))
+        t.remove(w(2))
+        // H[1, 3, 4]. Focus moves right: the engine enters 3 (mru of the old H).
+        XCTAssertEqual(t.neighbor(.right), w(3))
+        assertConsistent(t)
+    }
+
+    func testMoveAtRootDoesNotNestSameOrientation() {
+        var t = tree(1, 2)
+        t.split(.vertical)
+        t.insert(w(3))
+        // H[1, V[2, 3]]
+        t.setFocus(w(1))
+        XCTAssertTrue(t.moveFocused(.up))
+        // V[1, 2, 3], not V[1, V[2, 3]].
+        XCTAssertEqual(t.container(t.root)?.orientation, .vertical)
+        XCTAssertEqual(t.container(t.root)?.children.count, 3)
+        XCTAssertEqual(order(t), [1, 2, 3])
+        XCTAssertEqual(t.focused, w(1))
+        assertConsistent(t)
+        // A later move down swaps with 2 and changes the picture.
+        XCTAssertTrue(t.moveFocused(.down))
+        XCTAssertEqual(order(t), [2, 1, 3])
+        assertConsistent(t)
+    }
+
+    func testRemoveCollapsesRootWrapperOfOneLeaf() {
+        var t = TilingTree(root: .horizontal)
+        t.insert(w(2))
+        t.insert(w(1))
+        t.split(.vertical)
+        // H[2, V[1]]
+        t.remove(w(2))
+        XCTAssertEqual(t.nodes.count, 2, "root and one leaf")
+        XCTAssertEqual(t.container(t.root)?.orientation, .vertical, "root takes the wrapper orientation")
+        XCTAssertEqual(order(t), [1])
+        for d in Direction.allCases {
+            XCTAssertFalse(t.moveFocused(d), "no move for a lone window: \(d)")
+        }
+        // The next window goes below, as the wrapper asked.
+        t.insert(w(5))
+        XCTAssertEqual(frames(t)[w(5)], Rect(x: 0, y: 300, w: 1000, h: 300))
+        assertConsistent(t)
+    }
+
+    // MARK: Fuzz
+
+    /// Checks that no container holds a child container with its own
+    /// orientation. Only `toggleSplit` and `split` can make such nesting.
+    private func assertNoSameOrientationNesting(_ t: TilingTree, _ context: String,
+                                                file: StaticString = #filePath, line: UInt = #line) {
+        for (id, node) in t.nodes {
+            guard case .container(let c) = node else { continue }
+            for child in c.children {
+                if let cc = t.container(child) {
+                    XCTAssertNotEqual(cc.orientation, c.orientation, "nested same orientation: \(context)",
+                                      file: file, line: line)
+                }
+            }
+            if id != t.root {
+                XCTAssertGreaterThanOrEqual(c.children.count, 2, "one-child container: \(context)",
+                                            file: file, line: line)
+            }
+        }
+    }
+
+    func testRandomInsertRemoveFocusMoveKeepsTreeFlat() {
+        continueAfterFailure = false
+        var seed: UInt64 = 0x9E3779B97F4A7C15
+        func next(_ n: Int) -> Int {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return Int((seed >> 33) % UInt64(n))
+        }
+        for run in 0..<400 {
+            var t = TilingTree(root: next(2) == 0 ? .horizontal : .vertical)
+            var live: [UInt32] = []
+            var nextWindow: UInt32 = 1
+            var log: [String] = []
+            for step in 0..<40 {
+                switch next(6) {
+                case 0, 1:
+                    t.insert(w(nextWindow))
+                    live.append(nextWindow)
+                    log.append("insert \(nextWindow)")
+                    nextWindow += 1
+                case 2:
+                    guard let victim = live.indices.randomElementIndex(next) else { break }
+                    let id = live.remove(at: victim)
+                    t.remove(w(id))
+                    log.append("remove \(id)")
+                case 3:
+                    guard let pick = live.indices.randomElementIndex(next) else { break }
+                    t.setFocus(w(live[pick]))
+                    log.append("focus \(live[pick])")
+                default:
+                    let d = Direction.allCases[next(4)]
+                    t.moveFocused(d)
+                    log.append("move \(d)")
+                }
+                let context = "run \(run) step \(step): \(log.joined(separator: ", "))"
+                assertNoSameOrientationNesting(t, context)
+                XCTAssertEqual(Set(t.windows), Set(live.map { w($0) }), context)
+            }
+            assertConsistent(t)
+        }
+    }
+}
+
+private extension Range where Bound == Int {
+    /// Returns a random index from the range, or nil when it is empty.
+    func randomElementIndex(_ next: (Int) -> Int) -> Int? {
+        isEmpty ? nil : lowerBound + next(count)
+    }
 }
 
 final class WMStateTests: XCTestCase {
@@ -552,14 +828,76 @@ final class WMStateTests: XCTestCase {
         XCTAssertEqual(s.trees[b]?.container(s.trees[b]!.root)?.orientation, .vertical)
     }
 
-    func testTransferIgnoresAbsentWindowAndSameKey() {
+    func testTransferIgnoresSameKey() {
         var s = WMState()
         s.update(a) { $0.insert(w(1)) }
         let before = s
-        s.transfer(w(9), from: a, to: b)
         s.transfer(w(1), from: a, to: a)
-        s.transfer(w(1), from: b, to: a)
         XCTAssertEqual(s, before)
+    }
+
+    func testTransferWorksWhenRefreshAlreadyDroppedTheWindow() {
+        // A refresh removed the window from `from` while the move ran.
+        var s = WMState()
+        s.update(a) { $0.insert(w(1)) }
+        s.update(b) { $0.insert(w(3)) }
+        s.transfer(w(2), from: a, to: b)
+        XCTAssertEqual(s.tree(for: a).windows, [w(1)])
+        XCTAssertEqual(s.tree(for: b).windows, [w(3), w(2)])
+        XCTAssertEqual(s.tree(for: b).focused, w(2))
+    }
+
+    func testTransferRemovesWindowFromAnyOtherTree() {
+        let c = SpaceKey(display: DisplayID("D1"), space: SpaceID(3))
+        var s = WMState()
+        s.update(c) { $0.insert(w(1)); $0.insert(w(2)) }
+        // `from` is wrong. The window still leaves the tree that holds it.
+        s.transfer(w(2), from: a, to: b)
+        XCTAssertEqual(s.tree(for: c).windows, [w(1)])
+        XCTAssertEqual(s.tree(for: b).windows, [w(2)])
+        XCTAssertEqual(s.key(of: w(2)), b)
+    }
+
+    func testRekeyMovesTreeToTheDisplayThatNowHoldsItsSpace() {
+        let d2 = DisplayID("D2")
+        var s = WMState()
+        s.update(a) { $0.insert(w(1)); $0.insert(w(2)) }
+        s.update(b) { $0.insert(w(3)) }
+        // Space 1 moved to display D2. Space 2 stays on D1.
+        s.rekey(owners: [SpaceID(1): [d2], SpaceID(2): [DisplayID("D1")]])
+        let moved = SpaceKey(display: d2, space: SpaceID(1))
+        XCTAssertNil(s.trees[a])
+        XCTAssertEqual(s.trees[moved]?.windows, [w(1), w(2)])
+        XCTAssertEqual(s.trees[b]?.windows, [w(3)])
+    }
+
+    func testRekeyKeepsTreesWithShownOwnerOrUnknownSpace() {
+        var s = WMState()
+        s.update(a) { $0.insert(w(1)) }
+        let before = s
+        s.rekey(owners: [SpaceID(1): [DisplayID("D1"), DisplayID("D2")]])
+        s.rekey(owners: [SpaceID(9): [DisplayID("D2")]])
+        s.rekey(owners: [:])
+        XCTAssertEqual(s, before)
+    }
+
+    func testRekeyKeepsNonEmptyDestinationTree() {
+        let d2 = DisplayID("D2")
+        var s = WMState()
+        s.update(a) { $0.insert(w(1)) }
+        let moved = SpaceKey(display: d2, space: SpaceID(1))
+        s.update(moved) { $0.insert(w(5)) }
+        s.rekey(owners: [SpaceID(1): [d2]])
+        XCTAssertNil(s.trees[a])
+        XCTAssertEqual(s.trees[moved]?.windows, [w(5)])
+    }
+
+    func testPruneLiveSpacesKeepsTreesByTheirSpaceID() {
+        var s = WMState()
+        s.update(a) { $0.insert(w(1)) }
+        s.update(b) { $0.insert(w(2)) }
+        s.prune(liveSpaces: [SpaceID(2)])
+        XCTAssertEqual(Array(s.trees.keys), [b])
     }
 
     func testPruneKeepsLiveTrees() {

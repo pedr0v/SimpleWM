@@ -240,8 +240,11 @@ public final class WindowObserver {
                 log.debug("AX notification \(name, privacy: .public) unsupported by pid \(pid): \(status.rawValue)")
             }
         }
-        if notReady && attempt < Self.maxRetries {
-            // The app is not ready yet. Drop the partial set and retry.
+        if notReady {
+            // The app is not ready. Never keep a partial set: the missing
+            // notifications would stay missing until the app restarts. Drop the
+            // set. A retry runs, or after the last retry the pid rests (30 s)
+            // and the next `observe(pid:)` call tries the full set again.
             for name in registered {
                 AXObserverRemoveNotification(observer, appElement, name as CFString)
             }

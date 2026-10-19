@@ -29,6 +29,9 @@ public final class SkyLight: @unchecked Sendable {
     public typealias SetFrontProcessWithOptionsFn = @convention(c) (UnsafeMutablePointer<ProcessSerialNumber>, UInt32, UInt32) -> CGError
     /// `GetProcessForPID` (deprecated HIServices). Loaded with `dlsym` to avoid the warning.
     public typealias GetProcessForPIDFn = @convention(c) (pid_t, UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+    /// `_AXUIElementGetWindow(element, &windowID)` (private HIServices). Loaded
+    /// with `dlsym`, so a macOS update that removes it does not stop the launch.
+    public typealias AXUIElementGetWindowFn = @convention(c) (AXUIElement, UnsafeMutablePointer<UInt32>) -> AXError
 
     /// Shared loader. `nil` members mean the symbol is absent.
     public static let shared = SkyLight()
@@ -49,6 +52,7 @@ public final class SkyLight: @unchecked Sendable {
     public let performBridgedOperation: PerformBridgedOperationFn?
     public let setFrontProcessWithOptions: SetFrontProcessWithOptionsFn?
     public let getProcessForPID: GetProcessForPIDFn?
+    public let axUIElementGetWindow: AXUIElementGetWindowFn?
 
     /// Connection ID cached at load time. Zero when SkyLight is absent.
     public let cid: Int32
@@ -101,6 +105,12 @@ public final class SkyLight: @unchecked Sendable {
             getProcessForPID = unsafeBitCast(p, to: GetProcessForPIDFn.self)
         } else {
             getProcessForPID = nil
+        }
+        if let p = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") {
+            axUIElementGetWindow = unsafeBitCast(p, to: AXUIElementGetWindowFn.self)
+        } else {
+            SkyLight.log.warning("Accessibility symbol missing: _AXUIElementGetWindow. Windows cannot map to IDs.")
+            axUIElementGetWindow = nil
         }
         cid = mainConnectionID?() ?? 0
     }
@@ -199,7 +209,10 @@ public final class SkyLight: @unchecked Sendable {
     }
 }
 
-/// Private Accessibility function that maps an element to its `CGWindowID`.
-/// Present on macOS 26.1 (dlsym-verified).
-@_silgen_name("_AXUIElementGetWindow")
-public func _AXUIElementGetWindow(_ element: AXUIElement, _ out: UnsafeMutablePointer<UInt32>) -> AXError
+/// Maps an Accessibility element to its `CGWindowID`. The function calls the
+/// private `_AXUIElementGetWindow`, which `SkyLight` loads with `dlsym`.
+/// Returns `.failure` when the symbol is absent.
+public func _AXUIElementGetWindow(_ element: AXUIElement, _ out: UnsafeMutablePointer<UInt32>) -> AXError {
+    guard let getWindow = SkyLight.shared.axUIElementGetWindow else { return .failure }
+    return getWindow(element, out)
+}

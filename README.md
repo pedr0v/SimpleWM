@@ -152,6 +152,10 @@ good config, and the app logs the error. A bad binding is logged and skipped.
   display that shows a fullscreen Space gets no tiling. `space N` still works.
 - macOS lists windows only on visible Spaces. The app updates a tree only
   while its Space is visible.
+- A window set to "All Desktops" floats. The app does not tile it.
+- `move-to-space N` does nothing for a native fullscreen window.
+- After a screen change (plug, unplug, wake), the app waits 1 s before it
+  tiles again. macOS moves windows in that time.
 - Some apps have a minimum size or snap to a grid. They can refuse a frame.
   The app logs this and continues.
 - `space N` posts a synthetic Dock swipe. When that fails, it posts `Ctrl+N`.

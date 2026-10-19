@@ -56,9 +56,11 @@ public struct Rect: Equatable, Sendable, Codable {
     public var midX: Double { x + w / 2 }
     public var midY: Double { y + h / 2 }
 
-    /// Returns true when the point lies inside the rectangle (edges included).
+    /// Returns true when the point lies inside the rectangle. The left and top
+    /// edges belong to the rectangle. The right and bottom edges do not, so
+    /// two displays that share an edge never both contain one point.
     public func contains(x px: Double, y py: Double) -> Bool {
-        px >= minX && px <= maxX && py >= minY && py <= maxY
+        px >= minX && px < maxX && py >= minY && py < maxY
     }
 
     /// Returns the rectangle reduced by `amount` on each side.

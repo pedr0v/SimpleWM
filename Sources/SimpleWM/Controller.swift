@@ -11,6 +11,9 @@ import os
 /// 3. `refresh()` reads displays, skips displays whose current Space is type 4,
 ///    collects tileable windows per display, reconciles each tree, computes
 ///    frames, and writes only frames that differ by more than 2 pt.
+///    A refresh waits while a Space switch or a Space animation runs, and for
+///    one second after a screen change. A window joins the tree of a Space
+///    only when SkyLight lists that Space as its only Space.
 /// 4. Commands mutate the tree, then call `applyLayout()`.
 ///
 /// Tiling runs only when all hold: the controller is enabled, the
@@ -68,7 +71,37 @@ public final class WMController {
     private var timer: Timer?
     /// AX windows from the last refresh, by ID.
     private var windowCache: [WindowID: AXWindow] = [:]
-    private var warnedSharedSpaces = false
+
+    /// Time that the hold after a screen change ends. A refresh does nothing before it.
+    private var layoutHoldUntil: Date = .distantPast
+    /// Start of the current Space switch or animation. Nil when none runs.
+    private var transitionSince: Date?
+    /// First time a window was uncertain (AX timed out). A tree keeps such a
+    /// window for `uncertainLimit` seconds.
+    private var uncertainSince: [WindowID: Date] = [:]
+    /// Windows that skip the Space check until the given time. A window that
+    /// we moved to another display needs a moment until SkyLight follows.
+    private var spaceGraceUntil: [WindowID: Date] = [:]
+    /// Last frame write per window: the target and the frame read after it.
+    private struct FrameWrite {
+        var target: Rect
+        var result: Rect?
+    }
+    private var lastWrite: [WindowID: FrameWrite] = [:]
+    /// Window move and resize events of our own writes end here. They do not start a refresh.
+    private var selfWriteUntil: [WindowID: Date] = [:]
+    /// Spaces that the last refresh missed in the SkyLight list. A tree goes
+    /// only after two refreshes in a row miss its Space.
+    private var missingSpaces: Set<SpaceID> = []
+
+    /// Seconds without refresh after a screen change. macOS moves windows in this time.
+    static let screenSettleSeconds: TimeInterval = 1.0
+    /// Seconds that a tree keeps a window that AX cannot judge.
+    static let uncertainLimit: TimeInterval = 10
+    /// Seconds that a Space switch can hold refreshes. A stuck flag cannot stop tiling longer.
+    static let transitionLimit: TimeInterval = 3
+    /// Seconds in which our own move and resize events are ignored.
+    static let selfWriteQuiet: TimeInterval = 0.25
 
     /// Builds a controller with the production services.
     public static func makeDefault(config: Config) -> WMController {
@@ -131,7 +164,7 @@ public final class WMController {
         }
         observer.start()
         displayManager.onChange = { [weak self] in
-            self?.scheduleRefresh()
+            self?.screenParametersChanged()
         }
         spaceManager.onSpaceChange = { [weak self] in
             self?.scheduleRefresh()
@@ -163,6 +196,12 @@ public final class WMController {
         refreshTask?.cancel()
         refreshTask = nil
         windowCache = [:]
+        lastWrite = [:]
+        selfWriteUntil = [:]
+        uncertainSince = [:]
+        spaceGraceUntil = [:]
+        missingSpaces = []
+        layoutHoldUntil = .distantPast
         log.info("Stopped.")
         onStatusChange?()
     }
@@ -200,41 +239,77 @@ public final class WMController {
 
     /// Debounced refresh request.
     public func scheduleRefresh() {
+        scheduleRefresh(afterMs: 40)
+    }
+
+    private func scheduleRefresh(afterMs: UInt64) {
         guard enabled else { return }
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 40_000_000)
+            try? await Task.sleep(nanoseconds: afterMs * 1_000_000)
             guard !Task.isCancelled, let self else { return }
             self.refreshTask = nil
             if NSEvent.pressedMouseButtons & 0x1 != 0 {
                 // The user drags or resizes a window. Wait for the mouse up.
-                self.scheduleRefresh()
+                self.scheduleRefresh(afterMs: 40)
+                return
+            }
+            if let wait = self.refreshWaitMs() {
+                self.scheduleRefresh(afterMs: wait)
                 return
             }
             self.refresh()
         }
     }
 
+    /// Milliseconds to wait before a refresh may run, or nil when it may run now.
+    private func refreshWaitMs() -> UInt64? {
+        let now = Date()
+        if now < layoutHoldUntil {
+            return UInt64(layoutHoldUntil.timeIntervalSince(now) * 1000) + 20
+        }
+        if spaceTransitionRunning() { return 100 }
+        return nil
+    }
+
+    /// True while a Space switch or a Space animation runs. The window list
+    /// is not reliable then. After `transitionLimit` seconds the hold ends, so
+    /// a stuck flag cannot stop tiling.
+    private func spaceTransitionRunning() -> Bool {
+        guard spaceManager.isSwitching || spaceManager.isAnyDisplayAnimating() else {
+            transitionSince = nil
+            return false
+        }
+        let since = transitionSince ?? Date()
+        transitionSince = since
+        return Date().timeIntervalSince(since) < Self.transitionLimit
+    }
+
+    /// A screen was added, removed, or changed. macOS moves windows between
+    /// displays for about a second. A layout in that time would fight macOS.
+    private func screenParametersChanged() {
+        guard enabled else { return }
+        layoutHoldUntil = Date().addingTimeInterval(Self.screenSettleSeconds)
+        scheduleRefresh(afterMs: UInt64(Self.screenSettleSeconds * 1000) + 50)
+    }
+
     /// Full reconcile and layout pass. See type doc.
     public func refresh() {
         guard tilingActive else { return }
+        guard Date() >= layoutHoldUntil, !spaceTransitionRunning() else { return }
         let displays = spaceManager.displays()
         guard !displays.isEmpty else {
             log.debug("No display snapshot. SkyLight can be absent. Refresh skipped.")
             return
         }
 
-        // Trees of deleted Spaces disappear. Trees of hidden Spaces stay.
-        var live = Set<SpaceKey>()
-        for d in displays {
-            for s in d.spaces { live.insert(SpaceKey(display: d.id, space: s.id)) }
-        }
-        state.prune(live: live)
+        syncTreesWithSpaces()
 
         let windows = enumerator.tileableWindows()
         windowCache = Dictionary(windows.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         for w in windows { observer.observe(window: w) }
         let focused = enumerator.focusedWindow()
+        forgetStaleWindows()
 
         var targets = displays
         if !displayManager.screensHaveSeparateSpaces, displays.count > 1,
@@ -244,15 +319,72 @@ public final class WMController {
 
         let byDisplay = group(windows, by: displays)
         for d in targets {
-            guard d.current.isUser else { continue }
+            guard d.current.isUser, !spaceManager.isAnimating(d.id) else { continue }
             let key = SpaceKey(display: d.id, space: d.current.id)
-            let ids = (byDisplay[d.id] ?? []).map(\.id)
+            var ids = (byDisplay[d.id] ?? []).map(\.id).filter { belongsToCurrentSpace($0, on: d) }
+            ids += retainedWindows(in: key, besides: ids)
             reconcile(key, present: ids, workArea: d.workArea)
             if let f = focused, ids.contains(f.id) {
                 state.update(key) { $0.setFocus(f.id) }
             }
             applyLayout(key, on: d)
         }
+    }
+
+    /// Moves trees to the display that now holds their Space and drops trees of
+    /// deleted Spaces. Trees of hidden Spaces stay. The check uses the raw
+    /// SkyLight list, so a display without geometry does not count as gone.
+    /// A Space must be missing in two refreshes in a row before its tree goes.
+    private func syncTreesWithSpaces() {
+        let owners = spaceManager.liveSpaceOwners()
+        guard !owners.isEmpty else { return }
+        state.rekey(owners: owners)
+        let missing = Set(state.trees.keys.map(\.space)).subtracting(owners.keys)
+        let gone = missing.intersection(missingSpaces)
+        missingSpaces = missing
+        state.prune(liveSpaces: Set(owners.keys).union(missing.subtracting(gone)))
+    }
+
+    /// Drops cache entries of windows that do not exist anymore.
+    private func forgetStaleWindows() {
+        let now = Date()
+        let uncertain = enumerator.uncertainWindowIDs
+        uncertainSince = uncertainSince.filter { uncertain.contains($0.key) }
+        spaceGraceUntil = spaceGraceUntil.filter { $0.value > now }
+        selfWriteUntil = selfWriteUntil.filter { $0.value > now }
+        lastWrite = lastWrite.filter { windowCache[$0.key] != nil }
+    }
+
+    /// True when `id` belongs to the current Space of `d`: SkyLight lists that
+    /// Space as the only Space of the window. This keeps three kinds of window
+    /// out of the tree:
+    /// - a window on all desktops (several Spaces). It floats.
+    /// - a window of the old Space that is still on screen while a switch ends.
+    /// - a window that moved to another Space.
+    /// When SkyLight gives no answer, the on-screen test stands.
+    private func belongsToCurrentSpace(_ id: WindowID, on d: DisplaySnapshot) -> Bool {
+        if let until = spaceGraceUntil[id], until > Date() { return true }
+        let spaces = spaceManager.spaces(of: id)
+        guard !spaces.isEmpty else { return true }
+        return spaces == [d.current.id]
+    }
+
+    /// Windows of the tree `key` that AX cannot judge now (an app that hangs).
+    /// The tree keeps them for `uncertainLimit` seconds. They are on screen,
+    /// so they are not closed. Without this, a hang of 0.5 s drops the window
+    /// from the tree, and the layout jumps.
+    private func retainedWindows(in key: SpaceKey, besides present: [WindowID]) -> [WindowID] {
+        let uncertain = enumerator.uncertainWindowIDs
+        guard !uncertain.isEmpty, let tree = state.trees[key] else { return [] }
+        let have = Set(present)
+        let now = Date()
+        var keep: [WindowID] = []
+        for id in tree.windows where uncertain.contains(id) && !have.contains(id) {
+            let since = uncertainSince[id] ?? now
+            uncertainSince[id] = since
+            if now.timeIntervalSince(since) < Self.uncertainLimit { keep.append(id) }
+        }
+        return keep
     }
 
     /// Makes the tree for `key` match `present`. A window that now lives
@@ -272,21 +404,35 @@ public final class WMController {
 
     /// Computes frames for the tree of `key` and writes the frames that
     /// differ by more than 2 pt.
+    ///
+    /// An app can refuse a frame (minimum size, cell grid). The controller
+    /// remembers the target and the result of each write. It does not write
+    /// the same target again while the window still shows that result.
     private func applyLayout(_ key: SpaceKey, on display: DisplaySnapshot) {
         guard let tree = state.trees[key] else { return }
         let frames = tree.layout(in: display.workArea, gaps: config.gaps)
         for (id, rect) in frames {
-            guard let w = windowCache[id] else { continue }
-            if let current = w.frame, current.isClose(to: rect, tolerance: 2) { continue }
+            guard let w = windowCache[id], let live = w.frame else { continue }
+            if live.isClose(to: rect, tolerance: 2) {
+                lastWrite[id] = nil
+                continue
+            }
+            if let last = lastWrite[id], last.target == rect,
+               let result = last.result, live.isClose(to: result, tolerance: 2) {
+                continue
+            }
             let status = w.setFrame(rect)
+            selfWriteUntil[id] = Date().addingTimeInterval(Self.selfWriteQuiet)
+            lastWrite[id] = FrameWrite(target: rect, result: w.frame)
             if status != .success {
                 log.debug("Frame write for \(id.description, privacy: .public) returned \(status.rawValue, privacy: .public).")
             }
         }
     }
 
-    /// Splits windows by display. The SkyLight display comes first. The
-    /// frame center is the fallback.
+    /// Splits windows by display. The frame center comes first: it shows where
+    /// the window is now. The SkyLight display answers late after a move, so it
+    /// is the fallback.
     private func group(_ windows: [AXWindow], by displays: [DisplaySnapshot]) -> [DisplayID: [AXWindow]] {
         var result: [DisplayID: [AXWindow]] = [:]
         let ids = Set(displays.map(\.id))
@@ -300,9 +446,12 @@ public final class WMController {
 
     private func displayID(of w: AXWindow, displays: [DisplaySnapshot], known: Set<DisplayID>) -> DisplayID? {
         if displays.count == 1 { return displays[0].id }
+        if let f = w.frame,
+           let d = displays.first(where: { $0.frame.contains(x: f.midX, y: f.midY) }) {
+            return d.id
+        }
         if let d = spaceManager.display(of: w.id), known.contains(d) { return d }
-        guard let f = w.frame else { return nil }
-        return displays.first { $0.frame.contains(x: f.midX, y: f.midY) }?.id
+        return nil
     }
 
     // MARK: - Events
@@ -315,6 +464,13 @@ public final class WMController {
             }
         case .appLaunched, .appTerminated:
             updateAeroSpaceState(notify: true)
+        case .windowMoved(let id), .windowResized(let id):
+            // Our own frame write causes these events. A refresh for them
+            // would write the same frame again.
+            if let id, let until = selfWriteUntil[id], Date() < until { return }
+        case .screenParametersChanged:
+            screenParametersChanged()
+            return
         default:
             break
         }
@@ -425,6 +581,12 @@ public final class WMController {
             log.error("move-to-space \(n, privacy: .public): no display for the window.")
             return
         }
+        // Native fullscreen stays untouched. A fullscreen window lives in its
+        // own Space, and a move out of that Space breaks the Space.
+        guard d.current.isUser, !w.isFullscreen else {
+            log.info("move-to-space \(n, privacy: .public): native fullscreen Space or window. Skipped.")
+            return
+        }
         let user = d.userSpaces
         guard n >= 1, n <= user.count else {
             log.info("move-to-space \(n, privacy: .public): the display has \(user.count, privacy: .public) Spaces.")
@@ -432,6 +594,9 @@ public final class WMController {
         }
         let target = user[n - 1]
         guard target.id != d.current.id else { return }
+        // Read before the move: a refresh can drop the window from its tree
+        // while the move runs. The window still has to reach the new tree.
+        let wasTiled = state.key(of: w.id) != nil
         let from = state.key(of: w.id) ?? SpaceKey(display: d.id, space: d.current.id)
         let to = SpaceKey(display: d.id, space: target.id)
         let follow = config.followOnMove
@@ -441,7 +606,7 @@ public final class WMController {
             let ok = await self.spaceManager.move(w.id, toUserSpace: n, on: d)
             self.recordSwitch(ok, what: "move-to-space \(n)")
             guard ok else { return }
-            if self.tilingActive {
+            if self.tilingActive, wasTiled {
                 if self.state.trees[to] == nil {
                     self.state.trees[to] = TilingTree(root: self.config.rootOrientation(for: d.workArea))
                 }
@@ -527,13 +692,22 @@ public final class WMController {
         let displays = spaceManager.displays()
         guard let target = neighborDisplay(of: current, dir, in: displays) else { return }
         let key = SpaceKey(display: target.id, space: target.current.id)
-        let tree = state.tree(for: key)
-        guard let id = tree.focused ?? tree.windows.first, let w = windowCache[id] else {
-            log.debug("focus \(dir.rawValue, privacy: .public): the next display has no window.")
+        // A fullscreen Space has no tree. Use the tree only for a normal Space.
+        if target.current.isUser {
+            let tree = state.tree(for: key)
+            if let id = tree.focused ?? tree.windows.first, let w = windowCache[id] {
+                state.update(key) { $0.setFocus(id) }
+                w.focus()
+                return
+            }
+        }
+        // No tiled window: focus the front window of that display. This covers
+        // a fullscreen Space and a Space that holds only floating windows.
+        if let w = enumerator.topWindow(in: target.frame) {
+            w.focus()
             return
         }
-        state.update(key) { $0.setFocus(id) }
-        w.focus()
+        log.debug("focus \(dir.rawValue, privacy: .public): the next display has no window.")
     }
 
     private func move(_ dir: Direction) {
@@ -557,6 +731,9 @@ public final class WMController {
             state.trees[to] = TilingTree(root: config.rootOrientation(for: target.workArea))
         }
         state.transfer(w.id, from: ctx.key, to: to)
+        // SkyLight needs a moment to assign the window to the new display.
+        // Until then the Space check must not drop the window from its new tree.
+        spaceGraceUntil[w.id] = Date().addingTimeInterval(0.6)
         applyLayout(ctx.key, on: ctx.display)
         applyLayout(to, on: target)
         w.focus()

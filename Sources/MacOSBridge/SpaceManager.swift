@@ -96,6 +96,17 @@ enum SpaceReader {
     /// Mask for `SLSCopySpacesForWindows`: current, other, and user Spaces.
     static let allSpacesMask: Int32 = 0x7
 
+    /// Screen UUIDs (upper case) that `SpaceManager.displays()` made from the
+    /// shared `Main` entry. SkyLight knows these screens only as `Main`.
+    /// `displays()` sets the value on the main thread.
+    nonisolated(unsafe) static var sharedScreens: Set<String> = []
+
+    /// Identifier that SkyLight accepts for `display`. A screen of the shared
+    /// Space list maps to `Main`. Every other display keeps its UUID.
+    static func skyLightIdentifier(for display: DisplayID) -> String {
+        sharedScreens.contains(display.uuid.uppercased()) ? "Main" : display.uuid
+    }
+
     /// Parses `SLSCopyManagedDisplaySpaces`. Order follows the SkyLight array.
     static func rawDisplays(_ sl: SkyLight = .shared) -> [RawDisplaySpaces] {
         guard let copy = sl.copyManagedDisplaySpaces,
@@ -120,20 +131,21 @@ enum SpaceReader {
 
     /// Full Space list (fullscreen entries included) of one display.
     static func spaces(ofDisplay id: DisplayID, _ sl: SkyLight = .shared) -> [SpaceInfo]? {
-        rawDisplays(sl).first { $0.identifier == id.uuid }?.spaces
+        let name = skyLightIdentifier(for: id)
+        return rawDisplays(sl).first { $0.identifier.caseInsensitiveCompare(name) == .orderedSame }?.spaces
     }
 
     /// `SLSManagedDisplayGetCurrentSpace`. Returns nil for zero or a missing symbol.
     static func currentSpace(of display: DisplayID, _ sl: SkyLight = .shared) -> SpaceID? {
         guard let fn = sl.managedDisplayGetCurrentSpace else { return nil }
-        let sid = fn(sl.cid, display.uuid as CFString)
+        let sid = fn(sl.cid, skyLightIdentifier(for: display) as CFString)
         return sid == 0 ? nil : SpaceID(sid)
     }
 
     /// `SLSManagedDisplayIsAnimating`. False when the symbol is absent.
     static func isAnimating(_ display: DisplayID, _ sl: SkyLight = .shared) -> Bool {
         guard let fn = sl.managedDisplayIsAnimating else { return false }
-        return fn(sl.cid, display.uuid as CFString)
+        return fn(sl.cid, skyLightIdentifier(for: display) as CFString)
     }
 
     /// `SLSCopySpacesForWindows` with mask 0x7 for one window.
@@ -165,6 +177,34 @@ enum SpaceReader {
         while isAnimating(display), Date() < deadline {
             try? await Task.sleep(nanoseconds: 30_000_000)
         }
+    }
+
+    /// Waits until `display` stops. The display stops when it does not animate
+    /// and shows the same current Space for `stablePolls` polls in a row, each
+    /// `pollMs` apart. A burst of Dock swipes reports every hop as the current
+    /// Space, so one reading in the middle of a burst does not count.
+    ///
+    /// Returns the stable Space. Returns `target` at once when the display
+    /// reaches it. After `capMs` the function returns the last reading.
+    @MainActor
+    static func waitForStableSpace(on display: DisplayID, target: SpaceID? = nil,
+                                   pollMs: Int = 100, stablePolls: Int = 3, capMs: Int = 3000) async -> SpaceID? {
+        let deadline = Date().addingTimeInterval(Double(capMs) / 1000)
+        var last = currentSpace(of: display)
+        var same = 0
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
+            let now = currentSpace(of: display)
+            if let target, now == target { return now }
+            if now == last, !isAnimating(display) {
+                same += 1
+                if same >= stablePolls { return now }
+            } else {
+                same = 0
+                last = now
+            }
+        }
+        return last
     }
 
     /// Polls `SLSCopySpacesForWindows` until it lists `target`.
@@ -218,37 +258,40 @@ public final class SpaceManager {
 
     /// Reads `SLSCopyManagedDisplaySpaces` and builds one snapshot per display.
     ///
-    /// Geometry comes from `NSScreen` (matched by display UUID). The identifier
-    /// `Main` (shared Spaces) maps to `NSScreen.main`. A display without
-    /// geometry is skipped.
+    /// Geometry comes from `NSScreen` (matched by display UUID). A display
+    /// without geometry is skipped.
+    ///
+    /// With shared Spaces ("Displays have separate Spaces" off), SkyLight lists
+    /// one display named `Main`. The manager then builds one snapshot per
+    /// physical screen. Each snapshot has the screen UUID as `id`, the screen
+    /// geometry, and the shared Space list. So the tree of each screen stays
+    /// apart, and a layout never uses the geometry of another screen.
     public func displays() -> [DisplaySnapshot] {
         let raw = SpaceReader.rawDisplays(skyLight)
         guard !raw.isEmpty else { return [] }
         let infos = DisplayManager.currentDisplays()
         var result: [DisplaySnapshot] = []
+        var shared = Set<String>()
         for entry in raw {
-            let info: DisplayInfo?
+            let id = DisplayID(entry.identifier)
+            guard let current = currentSpaceInfo(of: entry, id: id) else { continue }
             if entry.identifier == "Main" {
-                info = DisplayManager.mainDisplayInfo() ?? infos.first
-            } else {
-                info = infos.first { $0.id.uuid.caseInsensitiveCompare(entry.identifier) == .orderedSame }
-                    ?? DisplayManager.cgDisplayInfo(uuid: entry.identifier)
-            }
-            guard let info else {
-                log.debug("No geometry for display \(entry.identifier, privacy: .public)")
+                let screens = infos.isEmpty ? (DisplayManager.mainDisplayInfo().map { [$0] } ?? []) : infos
+                for info in screens {
+                    shared.insert(info.id.uuid.uppercased())
+                    result.append(DisplaySnapshot(id: info.id,
+                                                  cgID: info.cgID,
+                                                  frame: info.frame,
+                                                  workArea: info.visibleFrame,
+                                                  spaces: entry.spaces,
+                                                  current: current))
+                }
                 continue
             }
-            let id = DisplayID(entry.identifier)
-            let liveCurrent = SpaceReader.currentSpace(of: id, skyLight)
-            let current: SpaceInfo
-            if let liveCurrent, let match = entry.spaces.first(where: { $0.id == liveCurrent }) {
-                current = match
-            } else if let c = entry.current {
-                current = entry.spaces.first { $0.id == c.id } ?? c
-            } else if let liveCurrent {
-                let type = skyLight.spaceGetType?(skyLight.cid, liveCurrent.raw) ?? 0
-                current = SpaceInfo(id: liveCurrent, type: type)
-            } else {
+            let info = infos.first { $0.id.uuid.caseInsensitiveCompare(entry.identifier) == .orderedSame }
+                ?? DisplayManager.cgDisplayInfo(uuid: entry.identifier)
+            guard let info else {
+                log.debug("No geometry for display \(entry.identifier, privacy: .public)")
                 continue
             }
             result.append(DisplaySnapshot(id: id,
@@ -258,7 +301,61 @@ public final class SpaceManager {
                                           spaces: entry.spaces,
                                           current: current))
         }
+        SpaceReader.sharedScreens = shared
         return result
+    }
+
+    /// Current Space of one SkyLight display entry. The live reading wins over
+    /// the entry. Returns nil when neither source has a Space.
+    private func currentSpaceInfo(of entry: RawDisplaySpaces, id: DisplayID) -> SpaceInfo? {
+        let liveCurrent = SpaceReader.currentSpace(of: id, skyLight)
+        if let liveCurrent, let match = entry.spaces.first(where: { $0.id == liveCurrent }) {
+            return match
+        }
+        if let c = entry.current {
+            return entry.spaces.first { $0.id == c.id } ?? c
+        }
+        if let liveCurrent {
+            let type = skyLight.spaceGetType?(skyLight.cid, liveCurrent.raw) ?? 0
+            return SpaceInfo(id: liveCurrent, type: type)
+        }
+        return nil
+    }
+
+    /// Every Space that SkyLight lists now, with the displays that own it.
+    ///
+    /// The function reads the raw SkyLight list, so a display without screen
+    /// geometry still counts. With shared Spaces, every screen owns every
+    /// Space. The controller uses the result to move and prune trees.
+    public func liveSpaceOwners() -> [SpaceID: Set<DisplayID>] {
+        var owners: [SpaceID: Set<DisplayID>] = [:]
+        for entry in SpaceReader.rawDisplays(skyLight) {
+            let displays: Set<DisplayID>
+            if entry.identifier == "Main" {
+                let screens = DisplayManager.currentDisplays().map(\.id)
+                displays = screens.isEmpty ? [DisplayID("Main")] : Set(screens)
+            } else {
+                displays = [DisplayID(entry.identifier)]
+            }
+            for space in entry.spaces { owners[space.id, default: []].formUnion(displays) }
+        }
+        return owners
+    }
+
+    /// True while a Space switch runs. A refresh that reads the on-screen
+    /// windows now sees a half-finished switch.
+    public var isSwitching: Bool { switchBusy }
+
+    /// True while SkyLight animates the Space change of `display`.
+    public func isAnimating(_ display: DisplayID) -> Bool {
+        SpaceReader.isAnimating(display, skyLight)
+    }
+
+    /// True while SkyLight animates any display.
+    public func isAnyDisplayAnimating() -> Bool {
+        SpaceReader.rawDisplays(skyLight).contains {
+            SpaceReader.isAnimating(DisplayID($0.identifier), skyLight)
+        }
     }
 
     /// Current Space of `display` from `SLSManagedDisplayGetCurrentSpace`.
@@ -392,6 +489,16 @@ public final class SpaceManager {
             }
             log.warning("Window move strategy \(strategy.name, privacy: .public) failed for \(w.description, privacy: .public) -> \(target.description, privacy: .public)")
         }
+        // A bridged move only queues its operation. It can land after its wait
+        // ends. Look once more before the call reports a failure.
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        if spaces(of: w).contains(target) {
+            let late = orderedMoveStrategies().first { $0.isAvailable() }?.name
+            log.notice("Window move of \(w.description, privacy: .public) landed late. It counts as a success.")
+            if let late { cachedMoveStrategy = late }
+            onSpaceChange?()
+            return true
+        }
         log.error("Window move of \(w.description, privacy: .public) to Space \(n) failed: no strategy verified")
         return false
     }
@@ -401,11 +508,20 @@ public final class SpaceManager {
 
 /// Synthetic Dock swipe (yabai v7.1.19 method). Primary strategy.
 /// It warps the cursor to the target display, posts one swipe per step,
-/// and polls `SLSManagedDisplayGetCurrentSpace` (30 ms, 600 ms max).
+/// and polls `SLSManagedDisplayGetCurrentSpace` (30 ms). The wait grows with
+/// the step count: 300 ms plus 250 ms per step, at least 600 ms.
 /// It repeats at most two rounds, then restores the cursor.
+///
+/// A burst of swipes reports every hop as the current Space. Round 2 starts
+/// only after the display stops: not animating, and the same Space for three
+/// polls 100 ms apart. So round 2 never adds swipes on top of queued hops.
 @MainActor
 public final class GestureSwitch: SpaceSwitchStrategy {
     public let name = "gesture"
+    /// `true`: warp the cursor to the target display for the swipes.
+    /// `false`: do not warp. The event location points at the target display
+    /// instead. The Dock can ignore that location. When a round moves nothing,
+    /// the next round warps the cursor anyway.
     public var warpCursor: Bool
     /// Sign multiplier for swipe progress. The strategy flips it when a
     /// round moves the display the wrong way.
@@ -434,20 +550,35 @@ public final class GestureSwitch: SpaceSwitchStrategy {
         return sl.copyManagedDisplaySpaces != nil && sl.managedDisplayGetCurrentSpace != nil
     }
 
+    /// Verification wait for one round: 300 ms plus 250 ms per step, at least 600 ms.
+    static func verifyTimeoutMs(steps: Int) -> Int {
+        max(600, 300 + 250 * steps)
+    }
+
+    /// True when `point` lies on `display`. Uses `CGGetDisplaysWithPoint`, so
+    /// the shared edge of two displays belongs to one display only.
+    static func isCursor(_ point: CGPoint, on display: DisplaySnapshot) -> Bool {
+        var id: CGDirectDisplayID = 0
+        var count: UInt32 = 0
+        if CGGetDisplaysWithPoint(point, 1, &id, &count) == .success, count > 0 {
+            return id == display.cgID
+        }
+        return display.frame.contains(x: Double(point.x), y: Double(point.y))
+    }
+
     public func switchTo(_ target: SpaceID, on display: DisplaySnapshot) async -> Bool {
         guard isAvailable() else { return false }
 
         // Warp only when the cursor is on another display.
         var restorePoint: CGPoint?
-        if warpCursor, let here = CGEvent(source: nil)?.location {
-            let f = display.frame
-            if !f.contains(x: Double(here.x), y: Double(here.y)) {
-                restorePoint = here
-                CGWarpMouseCursorPosition(CGPoint(x: f.midX, y: f.midY))
-                // Cancel the short local-event suppression after a warp.
-                CGAssociateMouseAndMouseCursorPosition(1)
-            }
+        func warpIfNeeded() {
+            guard let here = CGEvent(source: nil)?.location, !Self.isCursor(here, on: display) else { return }
+            if restorePoint == nil { restorePoint = here }
+            CGWarpMouseCursorPosition(CGPoint(x: display.frame.midX, y: display.frame.midY))
+            // Cancel the short local-event suppression after a warp.
+            CGAssociateMouseAndMouseCursorPosition(1)
         }
+        if warpCursor { warpIfNeeded() }
         defer {
             if let p = restorePoint {
                 CGWarpMouseCursorPosition(p)
@@ -455,6 +586,7 @@ public final class GestureSwitch: SpaceSwitchStrategy {
             }
         }
 
+        var lastRoundMoved = true
         for round in 1...Self.maxRounds {
             // yabai refuses to switch while the display animates. Wait instead.
             await SpaceReader.waitWhileAnimating(display.id, timeoutMs: 600)
@@ -469,19 +601,28 @@ public final class GestureSwitch: SpaceSwitchStrategy {
             }
             let delta = targetIndex - currentIndex
             let sign: Double = delta > 0 ? 1 : -1
-            postSwipes(steps: abs(delta), sign: sign * directionFactor, at: display)
+            let steps = abs(delta)
 
-            if await SpaceReader.waitForCurrentSpace(target, on: display.id, timeoutMs: 600) {
+            // Without a warp the Dock may act on the display under the real
+            // cursor. When the last round moved nothing, warp now.
+            if warpCursor || !lastRoundMoved {
+                if !warpCursor { log.notice("Gesture: no move without a warp. Warping the cursor (round \(round)).") }
+                warpIfNeeded()
+            }
+            postSwipes(steps: steps, sign: sign * directionFactor, at: display)
+
+            if await SpaceReader.waitForCurrentSpace(target, on: display.id,
+                                                     timeoutMs: Self.verifyTimeoutMs(steps: steps)) {
                 return true
             }
-            await SpaceReader.waitWhileAnimating(display.id, timeoutMs: 600)
-            if SpaceReader.currentSpace(of: display.id) == target { return true }
+            // The burst can still run. Wait until the display stops. Then read.
+            let settled = await SpaceReader.waitForStableSpace(on: display.id, target: target)
+            if settled == target { return true }
 
+            guard let after = settled, let afterIndex = spaces.firstIndex(of: after) else { return false }
+            lastRoundMoved = afterIndex != currentIndex
             // Learn the swipe direction when the display moved the wrong way.
-            if let after = SpaceReader.currentSpace(of: display.id),
-               let afterIndex = spaces.firstIndex(of: after),
-               afterIndex != currentIndex,
-               (afterIndex - currentIndex > 0) != (delta > 0) {
+            if lastRoundMoved, (afterIndex - currentIndex > 0) != (delta > 0) {
                 directionFactor = -directionFactor
                 log.notice("Gesture: swipe direction flipped (round \(round))")
             }
@@ -501,8 +642,9 @@ public final class GestureSwitch: SpaceSwitchStrategy {
             event.setDoubleValueField(f, value: value)
         }
         // With a warp, the event keeps the real cursor location (yabai does
-        // the same). Without a warp, point the event at the target display.
-        if !warpCursor {
+        // the same). When the cursor stays on another display, point the event
+        // at the target display. The Dock can ignore this hint.
+        if !Self.isCursor(event.location, on: display) {
             event.location = CGPoint(x: display.frame.midX, y: display.frame.midY)
         }
         setInt(Self.fieldEventType, Self.dockControlEventType)
@@ -650,7 +792,8 @@ public final class BridgedMove: WindowMoveStrategy {
               let op = makeOperation(windows: [w], space: target)
         else { return false }
         _ = perform(op)
-        return await SpaceReader.waitForWindow(w, on: target, timeoutMs: 500)
+        // The call only queues the operation. Give it time to land.
+        return await SpaceReader.waitForWindow(w, on: target, timeoutMs: 800)
     }
 
     /// Creates the operation object. Returns nil when the runtime refuses.
@@ -695,18 +838,41 @@ public final class CompatIDMove: WindowMoveStrategy {
 
     public func move(_ w: WindowID, to target: SpaceID) async -> Bool {
         let sl = SkyLight.shared
-        guard let setCompat = sl.spaceSetCompatID, let setWorkspace = sl.setWindowListWorkspace,
+        guard sl.spaceSetCompatID != nil, sl.setWindowListWorkspace != nil,
               sl.copySpacesForWindows != nil
         else { return false }
-        let e1 = setCompat(sl.cid, target.raw, Self.compatID)
+        let before = SpaceReader.spaces(ofWindow: w)
+        guard apply(w, to: target) else { return false }
+        if await SpaceReader.waitForWindow(w, on: target, timeoutMs: 500) { return true }
+        // No Space lists the window now: the window is orphaned. Put it back.
+        if SpaceReader.spaces(ofWindow: w).isEmpty, let home = before.first {
+            log.warning("Compat-ID: no Space lists \(w.description, privacy: .public). Moving it back to \(home.description, privacy: .public).")
+            _ = apply(w, to: home)
+        }
+        return false
+    }
+
+    /// Runs the three calls for one window. Returns false, without a move,
+    /// when `SLSSpaceSetCompatID` fails: then no Space owns the temporary
+    /// number, and a move to it could orphan the window.
+    private func apply(_ w: WindowID, to space: SpaceID) -> Bool {
+        let sl = SkyLight.shared
+        guard let setCompat = sl.spaceSetCompatID, let setWorkspace = sl.setWindowListWorkspace else { return false }
+        let e1 = setCompat(sl.cid, space.raw, Self.compatID)
+        guard e1 == .success else {
+            // Clear the compat ID also after an error.
+            _ = setCompat(sl.cid, space.raw, 0)
+            log.warning("Compat-ID: SLSSpaceSetCompatID failed (status \(e1.rawValue)). The window stays.")
+            return false
+        }
         var wid = w.raw
         let e2 = setWorkspace(sl.cid, &wid, 1, Self.compatID)
         // Always clear the compat ID, also after an error.
-        let e3 = setCompat(sl.cid, target.raw, 0)
-        if e1 != .success || e2 != .success || e3 != .success {
-            log.debug("Compat-ID: status \(e1.rawValue) \(e2.rawValue) \(e3.rawValue)")
+        let e3 = setCompat(sl.cid, space.raw, 0)
+        if e2 != .success || e3 != .success {
+            log.warning("Compat-ID: status \(e1.rawValue) \(e2.rawValue) \(e3.rawValue)")
         }
-        return await SpaceReader.waitForWindow(w, on: target, timeoutMs: 500)
+        return true
     }
 }
 
