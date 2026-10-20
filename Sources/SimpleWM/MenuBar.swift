@@ -1,6 +1,7 @@
 import AppKit
 
-/// Status item with: Enable/Disable, Open Config, Reload Config, the update item, Quit.
+/// Status item with: Enable/Disable, Open Config, Reload Config, Start at Login,
+/// the update item, Quit.
 /// The title shows `sWM` normally and `sWM!` after a failed Space switch.
 ///
 /// Title states:
@@ -11,18 +12,25 @@ import AppKit
 /// The update item shows "Check for Updates" by default. When the updater
 /// finds a new version V, it shows "Update (vV)". The item stays hidden
 /// until `onCheckForUpdates` is set.
+///
+/// The "Start at Login" item shows a check mark when macOS starts the app at
+/// login. The item stays hidden until `onToggleLoginItem` is set.
 @MainActor
 public final class MenuBar: NSObject {
     public let item: NSStatusItem
     public var onToggleEnabled: (() -> Void)?
     public var onOpenConfig: (() -> Void)?
     public var onReloadConfig: (() -> Void)?
+    public var onToggleLoginItem: (() -> Void)? {
+        didSet { loginMenuItem.isHidden = onToggleLoginItem == nil }
+    }
     public var onCheckForUpdates: (() -> Void)? {
         didSet { updateMenuItem.isHidden = onCheckForUpdates == nil }
     }
 
     private let statusMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let enabledMenuItem = NSMenuItem(title: "Enabled", action: nil, keyEquivalent: "")
+    private let loginMenuItem = NSMenuItem(title: "Start at Login", action: nil, keyEquivalent: "")
     private let updateMenuItem = NSMenuItem(title: MenuBar.checkForUpdatesTitle, action: nil, keyEquivalent: "")
 
     static let checkForUpdatesTitle = "Check for Updates"
@@ -60,6 +68,12 @@ public final class MenuBar: NSObject {
         menu.addItem(makeItem("Open Config", #selector(openConfig), key: ","))
         menu.addItem(makeItem("Reload Config", #selector(reloadConfig), key: "r"))
 
+        loginMenuItem.target = self
+        loginMenuItem.action = #selector(toggleLoginItem)
+        loginMenuItem.state = .off
+        loginMenuItem.isHidden = onToggleLoginItem == nil
+        menu.addItem(loginMenuItem)
+
         updateMenuItem.target = self
         updateMenuItem.action = #selector(checkForUpdates)
         updateMenuItem.isHidden = onCheckForUpdates == nil
@@ -71,8 +85,8 @@ public final class MenuBar: NSObject {
         item.menu = menu
     }
 
-    /// Updates the Enable/Disable title and the warning mark.
-    public func update(enabled: Bool, warning: Bool, accessibilityGranted: Bool) {
+    /// Updates the Enable/Disable title, the warning mark, and the login item check mark.
+    public func update(enabled: Bool, warning: Bool, accessibilityGranted: Bool, startAtLogin: Bool) {
         // A warning has priority over the disabled mark.
         let title: String
         if warning || !accessibilityGranted {
@@ -84,6 +98,7 @@ public final class MenuBar: NSObject {
         }
         item.button?.title = title
         enabledMenuItem.state = enabled ? .on : .off
+        loginMenuItem.state = startAtLogin ? .on : .off
     }
 
     /// Shows `text` as a disabled first menu row. Nil hides the row.
@@ -111,6 +126,7 @@ public final class MenuBar: NSObject {
     @objc private func toggleEnabled() { onToggleEnabled?() }
     @objc private func openConfig() { onOpenConfig?() }
     @objc private func reloadConfig() { onReloadConfig?() }
+    @objc private func toggleLoginItem() { onToggleLoginItem?() }
     @objc private func checkForUpdates() { onCheckForUpdates?() }
     @objc private func quit() { NSApp.terminate(nil) }
 }

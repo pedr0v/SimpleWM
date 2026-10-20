@@ -2,15 +2,18 @@ import AppKit
 import LayoutEngine
 import MacOSBridge
 import os
+import ServiceManagement
 
 /// Wires the config, the controller, the menu bar, and the updater.
 ///
 /// Startup:
 /// 1. Write the default config when the file is absent. Load the config.
 /// 2. Build the controller and install the menu bar.
-/// 3. Start the updater. It probes for a new release 10 s later and every 24 h.
+/// 3. Register the login item at the first start from `/Applications`.
+///    A dry run never registers. The menu shows "Start at Login".
+/// 4. Start the updater. It probes for a new release 10 s later and every 24 h.
 ///    The menu shows "Update (vX.Y.Z)" when a release is newer.
-/// 4. Check the Accessibility grant. Without it, show the system prompt and
+/// 5. Check the Accessibility grant. Without it, show the system prompt and
 ///    poll every 2 s. Start the controller when the grant arrives.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -43,6 +46,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBar.onOpenConfig = { [weak self] in self?.openConfig() }
         menuBar.onReloadConfig = { [weak self] in self?.reloadConfig() }
         menuBar.install()
+        if !dryRun {
+            LoginItem.registerOnFirstRun(log: log)
+        }
+        // The login item works only inside the app bundle. `.build/debug/SimpleWM` has no login item.
+        if LoginItem.runsFromBundle {
+            menuBar.onToggleLoginItem = { [weak self] in self?.toggleLoginItem() }
+        }
         updateMenu()
 
         // The updater runs only inside the app bundle. `.build/debug/SimpleWM` has no update item.
@@ -205,11 +215,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenu()
     }
 
+    // MARK: - Login item
+
+    /// Turns the login item on or off. Opens System Settings when macOS waits for approval.
+    private func toggleLoginItem() {
+        let on = !LoginItem.isEnabled
+        do {
+            try LoginItem.setEnabled(on)
+            log.notice("Login item \(on ? "on" : "off", privacy: .public).")
+        } catch {
+            log.error("Login item change failed: \(String(describing: error), privacy: .public)")
+        }
+        if LoginItem.status == .requiresApproval {
+            SMAppService.openSystemSettingsLoginItems()
+        }
+        updateMenu()
+    }
+
     private func updateMenu() {
         guard let controller else { return }
         menuBar.update(enabled: controller.enabled,
                        warning: controller.warning,
-                       accessibilityGranted: Permissions.isAccessibilityTrusted())
+                       accessibilityGranted: Permissions.isAccessibilityTrusted(),
+                       startAtLogin: LoginItem.isEnabled)
         menuBar.setStatus(controller.statusText)
     }
 }

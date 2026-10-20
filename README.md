@@ -83,8 +83,12 @@ The status item shows a split icon and a short title:
 | `sWM!` | Warning: no Accessibility grant, AeroSpace runs, or the last Space switch, creation, or move failed. |
 | `sWM·` | Disabled. |
 
-Menu items: Enabled (toggle), Open Config, Reload Config, the update item,
-Quit. When a warning is active, the first menu row shows the reason.
+Menu items: Enabled (toggle), Open Config, Reload Config, Start at Login,
+the update item, Quit. When a warning is active, the first menu row shows the reason.
+
+"Start at Login" is on by default. The app registers itself at the first
+start from `/Applications`. macOS can ask for approval in System Settings >
+General > Login Items. Use the menu item to turn it off.
 
 The update item shows "Check for Updates", or "Update (vX.Y.Z)" when
 a newer release exists (see Updates). A build that runs outside the app
