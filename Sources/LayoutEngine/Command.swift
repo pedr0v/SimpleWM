@@ -24,6 +24,10 @@ public enum Command: Equatable, Sendable {
     case resize(Double)
     /// Toggles the focused window between tiled and floating.
     case toggleFloat
+    /// Moves focus to the next display in a direction, without walking the tree.
+    case focusMonitor(Direction)
+    /// Moves the focused window to the next display in a direction.
+    case moveToMonitor(Direction)
 
     /// Parses the text form. Returns nil for unknown text. Parsing is case-insensitive.
     public static func parse(_ text: String) -> Command? {
@@ -49,6 +53,10 @@ public enum Command: Equatable, Sendable {
             return .balance
         case ("toggle-float", nil), ("float", nil):
             return .toggleFloat
+        case ("focus-monitor", let d?):
+            return Direction(rawValue: d).map(Command.focusMonitor)
+        case ("move-to-monitor", let d?):
+            return Direction(rawValue: d).map(Command.moveToMonitor)
         case ("resize", let d?):
             return Double(d).map(Command.resize)
         default:

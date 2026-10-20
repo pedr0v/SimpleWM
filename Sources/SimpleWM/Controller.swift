@@ -558,6 +558,10 @@ public final class WMController {
             mutateFocusedTree { $0.resize(delta: delta) }
         case .toggleFloat:
             toggleFloat()
+        case .focusMonitor(let d):
+            focusMonitor(d)
+        case .moveToMonitor(let d):
+            moveToMonitor(d)
         }
     }
 
@@ -771,6 +775,46 @@ public final class WMController {
         }
     }
 
+    /// Moves focus to the next display in `dir`. The tree is not walked.
+    private func focusMonitor(_ dir: Direction) {
+        guard tilingActive else { return }
+        refresh()
+        focusNeighborDisplay(dir, from: focusedContext()?.display ?? focusedDisplay())
+    }
+
+    /// Moves the focused window to the next display in `dir`, into the
+    /// tree of that display's current Space. A fullscreen Space there is
+    /// skipped. The window keeps focus.
+    private func moveToMonitor(_ dir: Direction) {
+        guard tilingActive else { return }
+        refresh()
+        guard let ctx = focusedContext(), let w = ctx.window else { return }
+        state.update(ctx.key) { $0.setFocus(w.id) }
+        moveToNeighborDisplay(w, from: ctx, dir)
+    }
+
+    /// Transfers `w` from `ctx` to the next display in `dir`.
+    /// Returns false when no display lies there or it shows a fullscreen Space.
+    @discardableResult
+    private func moveToNeighborDisplay(_ w: AXWindow, from ctx: FocusContext, _ dir: Direction) -> Bool {
+        let displays = spaceManager.displays()
+        guard let target = neighborDisplay(of: ctx.display, dir, in: displays),
+              target.current.isUser else { return false }
+        let to = SpaceKey(display: target.id, space: target.current.id)
+        if state.trees[to] == nil {
+            state.trees[to] = TilingTree(root: config.rootOrientation(for: target.workArea))
+        }
+        state.transfer(w.id, from: ctx.key, to: to)
+        // SkyLight needs a moment to assign the window to the new display.
+        // Until then the Space check must not drop the window from its new tree.
+        spaceGraceUntil[w.id] = Date().addingTimeInterval(0.6)
+        applyLayout(ctx.key, on: ctx.display)
+        applyLayout(to, on: target)
+        w.focus()
+        scheduleRefresh()
+        return true
+    }
+
     private func focusNeighborDisplay(_ dir: Direction, from current: DisplaySnapshot?) {
         guard let current else { return }
         let displays = spaceManager.displays()
@@ -807,21 +851,7 @@ public final class WMController {
         }
 
         // Root edge: move the window to the next display in `dir`.
-        let displays = spaceManager.displays()
-        guard let target = neighborDisplay(of: ctx.display, dir, in: displays),
-              target.current.isUser else { return }
-        let to = SpaceKey(display: target.id, space: target.current.id)
-        if state.trees[to] == nil {
-            state.trees[to] = TilingTree(root: config.rootOrientation(for: target.workArea))
-        }
-        state.transfer(w.id, from: ctx.key, to: to)
-        // SkyLight needs a moment to assign the window to the new display.
-        // Until then the Space check must not drop the window from its new tree.
-        spaceGraceUntil[w.id] = Date().addingTimeInterval(0.6)
-        applyLayout(ctx.key, on: ctx.display)
-        applyLayout(to, on: target)
-        w.focus()
-        scheduleRefresh()
+        moveToNeighborDisplay(w, from: ctx, dir)
     }
 
     /// Nearest display whose center lies in direction `dir` from `current`.

@@ -104,6 +104,8 @@ bundle (`.build/debug/SimpleWM`) has no update item.
 | `alt-shift-minus` | `resize -0.05` | Make the window smaller. |
 | `alt-shift-equal` | `resize 0.05` | Make the window larger. |
 | `alt-shift-space` | `toggle-float` | Toggle the focused window between tiled and floating. |
+| `alt-comma` / `alt-period` | `focus-monitor left/right` | Move focus to the display on that side. |
+| `alt-shift-comma` / `alt-shift-period` | `move-to-monitor left/right` | Move the window to the display on that side. |
 
 `N` follows the Mission Control order of the focused display. A fullscreen
 app counts as one Space. `move-to-space N` only targets a normal desktop.
@@ -164,7 +166,7 @@ Keys:
     `space`, `return`, `tab`, `escape`.
   - Commands: `focus D`, `move D`, `space N`, `move-to-space N`,
     `fullscreen`, `toggle-split`, `split horizontal|vertical`, `balance`,
-    `resize X`, `toggle-float`.
+    `resize X`, `toggle-float`, `focus-monitor D`, `move-to-monitor D`.
 - `createMissingSpaces`: when `true` (default), `space N` and
   `move-to-space N` create desktops on the focused display until it has N
   Spaces. When `false`, a key for a missing Space does nothing.
