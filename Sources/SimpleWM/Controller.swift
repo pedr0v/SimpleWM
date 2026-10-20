@@ -84,6 +84,11 @@ public final class WMController {
     /// Windows that skip the Space check until the given time. A window that
     /// we moved to another display needs a moment until SkyLight follows.
     private var spaceGraceUntil: [WindowID: Date] = [:]
+    /// Space that each display showed before its current Space.
+    /// The `back-and-forth` command switches to this Space.
+    private var previousSpace: [DisplayID: SpaceID] = [:]
+    /// Last current Space that `trackSpaceHistory` saw for each display.
+    private var seenSpace: [DisplayID: SpaceID] = [:]
     /// Last frame write per window: the target and the frame read after it.
     private struct FrameWrite {
         var target: Rect
@@ -174,6 +179,7 @@ public final class WMController {
             self?.screenParametersChanged()
         }
         spaceManager.onSpaceChange = { [weak self] in
+            self?.trackSpaceHistory()
             self?.scheduleRefresh()
         }
 
@@ -207,6 +213,8 @@ public final class WMController {
         selfWriteUntil = [:]
         uncertainSince = [:]
         spaceGraceUntil = [:]
+        previousSpace = [:]
+        seenSpace = [:]
         missingSpaces = []
         layoutHoldUntil = .distantPast
         log.info("Stopped.")
@@ -306,6 +314,7 @@ public final class WMController {
         guard tilingActive else { return }
         guard Date() >= layoutHoldUntil, !spaceTransitionRunning() else { return }
         let displays = spaceManager.displays()
+        trackSpaceHistory(displays)
         guard !displays.isEmpty else {
             log.debug("No display snapshot. SkyLight can be absent. Refresh skipped.")
             return
@@ -481,6 +490,8 @@ public final class WMController {
         case .screenParametersChanged:
             screenParametersChanged()
             return
+        case .activeSpaceChanged:
+            trackSpaceHistory()
         default:
             break
         }
@@ -562,6 +573,43 @@ public final class WMController {
             focusMonitor(d)
         case .moveToMonitor(let d):
             moveToMonitor(d)
+        case .backAndForth:
+            backAndForth()
+        }
+    }
+
+    /// Records the current Space of each display. When the current Space
+    /// changes, the old Space becomes the previous Space of that display.
+    private func trackSpaceHistory(_ displays: [DisplaySnapshot]? = nil) {
+        for d in displays ?? spaceManager.displays() where seenSpace[d.id] != d.current.id {
+            if let old = seenSpace[d.id] { previousSpace[d.id] = old }
+            seenSpace[d.id] = d.current.id
+        }
+    }
+
+    /// Switches the focused display to its previous Space, as in i3.
+    /// A second call goes back to the first Space.
+    private func backAndForth() {
+        trackSpaceHistory()
+        guard let d = focusedDisplay() else {
+            log.error("back-and-forth: no display found.")
+            return
+        }
+        guard let prev = previousSpace[d.id], prev != d.current.id else {
+            log.info("back-and-forth: no previous Space on this display.")
+            return
+        }
+        guard let index = d.spaces.firstIndex(where: { $0.id == prev }) else {
+            // The user deleted the previous Space.
+            previousSpace[d.id] = nil
+            log.info("back-and-forth: the previous Space does not exist now.")
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let ok = await self.spaceManager.switchTo(userSpace: index + 1, on: d)
+            self.recordSpaceSwitch(ok, what: "back-and-forth")
+            self.scheduleRefresh()
         }
     }
 

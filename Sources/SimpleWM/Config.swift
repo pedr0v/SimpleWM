@@ -42,6 +42,7 @@ public struct Config: Codable, Equatable {
             "alt-shift-space": "toggle-float",
             "alt-comma": "focus-monitor left", "alt-period": "focus-monitor right",
             "alt-shift-comma": "move-to-monitor left", "alt-shift-period": "move-to-monitor right",
+            "alt-tab": "back-and-forth",
         ]
         for n in 1...9 {
             b["alt-\(n)"] = "space \(n)"

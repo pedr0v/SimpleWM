@@ -13,6 +13,9 @@ final class LayoutEngineTests: XCTestCase {
         XCTAssertNil(Command.parse("move-to-monitor"))
         XCTAssertNil(Command.parse("toggle-float x"))
         XCTAssertNil(Command.parse("space 0"))
+        XCTAssertEqual(Command.parse("back-and-forth"), .backAndForth)
+        XCTAssertEqual(Command.parse("space back"), .backAndForth)
+        XCTAssertNil(Command.parse("back-and-forth x"))
         XCTAssertNil(Command.parse("bogus"))
     }
 

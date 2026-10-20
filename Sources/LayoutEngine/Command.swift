@@ -6,6 +6,7 @@ import Foundation
 /// - `focus left|down|up|right`
 /// - `move left|down|up|right`
 /// - `space N` (N in 1...9)
+/// - `back-and-forth` or `space back` (previous Space of the focused display)
 /// - `move-to-space N` (N in 1...9)
 /// - `fullscreen` (zoom inside the tree, not native fullscreen)
 /// - `toggle-split` (flip the parent orientation of the focused window)
@@ -28,6 +29,8 @@ public enum Command: Equatable, Sendable {
     case focusMonitor(Direction)
     /// Moves the focused window to the next display in a direction.
     case moveToMonitor(Direction)
+    /// Switches the focused display to its previous Space.
+    case backAndForth
 
     /// Parses the text form. Returns nil for unknown text. Parsing is case-insensitive.
     public static func parse(_ text: String) -> Command? {
@@ -39,6 +42,8 @@ public enum Command: Equatable, Sendable {
             return Direction(rawValue: d).map(Command.focus)
         case ("move", let d?):
             return Direction(rawValue: d).map(Command.move)
+        case ("back-and-forth", nil), ("space", "back"):
+            return .backAndForth
         case ("space", let n?):
             return Int(n).flatMap { (1...9).contains($0) ? .gotoSpace($0) : nil }
         case ("move-to-space", let n?):

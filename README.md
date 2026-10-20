@@ -96,6 +96,7 @@ bundle (`.build/debug/SimpleWM`) has no update item.
 |-------|---------|--------|
 | `alt-1` ... `alt-9` | `space N` | Switch to native Space N of the focused display. |
 | `alt-shift-1` ... `alt-shift-9` | `move-to-space N` | Move the focused window to Space N. |
+| `alt-tab` | `back-and-forth` | Switch to the previous Space of the focused display, as in i3. |
 | `alt-h` / `alt-j` / `alt-k` / `alt-l` | `focus left/down/up/right` | Move focus. At the edge, focus goes to the next display. |
 | `alt-shift-h/j/k/l` | `move left/down/up/right` | Move the window in the tree. At the edge, the window goes to the next display. |
 | `alt-f` | `fullscreen` | Zoom the window inside the tree. Native fullscreen is not used. |
@@ -166,7 +167,8 @@ Keys:
     `space`, `return`, `tab`, `escape`.
   - Commands: `focus D`, `move D`, `space N`, `move-to-space N`,
     `fullscreen`, `toggle-split`, `split horizontal|vertical`, `balance`,
-    `resize X`, `toggle-float`, `focus-monitor D`, `move-to-monitor D`.
+    `resize X`, `toggle-float`, `focus-monitor D`, `move-to-monitor D`,
+    `back-and-forth` (alias `space back`).
 - `createMissingSpaces`: when `true` (default), `space N` and
   `move-to-space N` create desktops on the focused display until it has N
   Spaces. When `false`, a key for a missing Space does nothing.
