@@ -116,7 +116,13 @@ if [ "${SIMPLEWM_NOTARIZE:-0}" = "1" ]; then
   xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
     --password "$APPLE_APP_PASSWORD" --wait
   echo "==> staple"
-  xcrun stapler staple "$APP"
+  # Apple's ticket server drops connections at times. Try a few times.
+  for attempt in 1 2 3 4 5; do
+    if xcrun stapler staple "$APP"; then break; fi
+    [ "$attempt" -lt 5 ] || { echo "Staple failed after $attempt attempts." >&2; exit 1; }
+    echo "Staple attempt $attempt failed. Retry in 30 s."
+    sleep 30
+  done
   xcrun stapler validate "$APP"
   spctl --assess --type execute --verbose=2 "$APP"
 fi
