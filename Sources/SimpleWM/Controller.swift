@@ -31,6 +31,7 @@ public final class WMController {
 
     public let spaceManager: SpaceManager
     public let spaceCreator: SpaceCreator
+    public let spaceRemover: SpaceRemover
     public let displayManager: DisplayManager
     public let enumerator: WindowEnumerator
     public let observer: WindowObserver
@@ -72,6 +73,10 @@ public final class WMController {
     }
 
     private var refreshTask: Task<Void, Never>?
+    /// Debounced removal of empty Spaces. See `scheduleSpaceCleanup`.
+    private var cleanupTask: Task<Void, Never>?
+    /// Delay between the last refresh and a cleanup pass.
+    static let cleanupDelayMs: UInt64 = 1500
     private var timer: Timer?
     /// AX windows from the last refresh, by ID.
     private var windowCache: [WindowID: AXWindow] = [:]
@@ -132,6 +137,7 @@ public final class WMController {
                         switchStrategies: switches,
                         moveStrategies: [BridgedMove(), CompatIDMove(), ManagedSpaceMove()]),
                      spaceCreator: SpaceCreator(),
+                     spaceRemover: SpaceRemover(),
                      displayManager: DisplayManager(),
                      enumerator: enumerator,
                      observer: WindowObserver(),
@@ -141,6 +147,7 @@ public final class WMController {
     public init(config: Config,
                 spaceManager: SpaceManager,
                 spaceCreator: SpaceCreator,
+                spaceRemover: SpaceRemover,
                 displayManager: DisplayManager,
                 enumerator: WindowEnumerator,
                 observer: WindowObserver,
@@ -149,6 +156,7 @@ public final class WMController {
         self.state = WMState()
         self.spaceManager = spaceManager
         self.spaceCreator = spaceCreator
+        self.spaceRemover = spaceRemover
         self.displayManager = displayManager
         self.enumerator = enumerator
         self.observer = observer
@@ -213,6 +221,8 @@ public final class WMController {
         timer = nil
         refreshTask?.cancel()
         refreshTask = nil
+        cleanupTask?.cancel()
+        cleanupTask = nil
         windowCache = [:]
         lastWrite = [:]
         selfWriteUntil = [:]
@@ -354,6 +364,55 @@ public final class WMController {
             applyLayout(key, on: d)
         }
         userResized = []
+        scheduleSpaceCleanup()
+    }
+
+    // MARK: - Empty Spaces
+
+    /// Removes empty desktops after a pause, as i3 drops an empty workspace.
+    ///
+    /// The pass runs `cleanupDelayMs` after the last request. It runs only
+    /// when the config allows it, the Accessibility grant exists, no mouse
+    /// button is down, no Space transition runs, and Mission Control is
+    /// closed. One spare empty desktop stays on each display. See
+    /// `SpaceManager.emptySpaceCandidates(on:)` for the rules.
+    private func scheduleSpaceCleanup() {
+        guard enabled, config.removeEmptySpaces, !dryRun else { return }
+        cleanupTask?.cancel()
+        cleanupTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.cleanupDelayMs * 1_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.cleanupTask = nil
+            await self.removeEmptySpaces()
+        }
+    }
+
+    private func removeEmptySpaces() async {
+        guard enabled, config.removeEmptySpaces, Permissions.isAccessibilityTrusted(),
+              spaceRemover.isAvailable() else { return }
+        if NSEvent.pressedMouseButtons != 0 || spaceTransitionRunning() || spaceRemover.busy
+            || MissionControl.isOpen() {
+            scheduleSpaceCleanup()
+            return
+        }
+        for d in spaceManager.displays() {
+            let candidates = spaceManager.emptySpaceCandidates(on: d)
+            guard !candidates.isEmpty else { continue }
+            let ids = candidates.map(\.id)
+            log.info("Empty Spaces on \(d.id.uuid, privacy: .public): \(ids.count, privacy: .public). Removing.")
+            guard let removed = await spaceManager.removeSpaces(ids, on: d, remover: spaceRemover) else { continue }
+            if removed < ids.count {
+                recordSwitch(false, what: "remove empty Spaces", reason: "The app could not remove every empty Space.")
+            } else {
+                recordSwitch(true, what: "remove empty Spaces")
+            }
+            for s in candidates.prefix(removed) {
+                state.trees[SpaceKey(display: d.id, space: s.id)] = nil
+            }
+            // One display per pass: the list of the others can shift.
+            scheduleRefresh()
+            return
+        }
     }
 
     /// Gives the live frames of user-resized windows in tree `key` to the

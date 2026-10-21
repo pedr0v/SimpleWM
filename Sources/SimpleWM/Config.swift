@@ -21,6 +21,10 @@ public struct Config: Codable, Equatable {
     /// When true, `space N` and `move-to-space N` create desktops on the
     /// display until it has N Spaces. Creation opens Mission Control for a moment.
     public var createMissingSpaces: Bool = true
+    /// When true, the app removes an empty desktop that is not the first,
+    /// not the current, and not the last one of its display. One spare
+    /// empty desktop stays at the end, as in Mission Control.
+    public var removeEmptySpaces: Bool = true
     public var spaceSwitch: SpaceSwitch = SpaceSwitch()
     public var floatingApps: [String] = ["com.apple.systempreferences"]
     /// When true, a window without a usable zoom button floats. Settings
@@ -30,7 +34,7 @@ public struct Config: Codable, Equatable {
     public var bindings: [String: String] = Config.defaultBindings
 
     enum CodingKeys: String, CodingKey {
-        case gaps, rootOrientation, followOnMove, createMissingSpaces, spaceSwitch, floatingApps, floatWindowsWithoutZoom, bindings
+        case gaps, rootOrientation, followOnMove, createMissingSpaces, removeEmptySpaces, spaceSwitch, floatingApps, floatWindowsWithoutZoom, bindings
     }
 
     public static let defaultBindings: [String: String] = {
@@ -121,6 +125,7 @@ extension Config {
         }
         followOnMove = try c.decodeIfPresent(Bool.self, forKey: .followOnMove) ?? followOnMove
         createMissingSpaces = try c.decodeIfPresent(Bool.self, forKey: .createMissingSpaces) ?? createMissingSpaces
+        removeEmptySpaces = try c.decodeIfPresent(Bool.self, forKey: .removeEmptySpaces) ?? removeEmptySpaces
         if let s = try c.decodeIfPresent(SpaceSwitch.self, forKey: .spaceSwitch) {
             guard ["auto", "gesture", "ctrl-n"].contains(s.strategy.lowercased()) else {
                 throw DecodingError.dataCorruptedError(

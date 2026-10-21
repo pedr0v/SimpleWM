@@ -30,28 +30,9 @@ import os
 /// of the display does not change.
 @MainActor
 public final class SpaceCreator {
-    /// Poll interval for the Dock AX tree: 10 ms.
-    static let axPollMs = 10
-    /// Poll interval for SkyLight: 50 ms.
-    static let skyLightPollMs = 50
-    /// Cap for one wait in steps 3, 4, and 6.
-    static let waitCapMs = 2000
     /// Total budget for steps 3 to 6.
     static let budgetMs = 3000
-    /// Cap for the close wait. Escape is the fallback.
-    static let closeCapMs = 1000
-    /// Pause after the close, so the animation ends before a Space switch.
-    static let settleMs = 300
-    /// Timeout of one AX request to the Dock, in seconds.
-    static let axMessagingTimeout: Float = 1.0
-
-    static let dockBundleID = "com.apple.dock"
-    static let missionControlURL = URL(fileURLWithPath: "/System/Applications/Mission Control.app")
-    static let missionControlID = "mc"
-    static let displayGroupID = "mc.display"
     static let addButtonID = "mc.spaces.add"
-    /// Virtual key code of Escape.
-    static let escapeKeyCode: CGKeyCode = 53
 
     private let log = Logger(subsystem: "com.simplewm.app", category: "spaces")
     private let skyLight: SkyLight
@@ -64,7 +45,7 @@ public final class SpaceCreator {
     /// True when `createSpace(on:)` can run: Accessibility grant, SkyLight
     /// Space list, and a running Dock.
     public func isAvailable() -> Bool {
-        AXIsProcessTrusted() && skyLight.copyManagedDisplaySpaces != nil && dockElement() != nil
+        AXIsProcessTrusted() && skyLight.copyManagedDisplaySpaces != nil && MissionControl.dockElement() != nil
     }
 
     /// Creates one desktop on `display`. Returns its Space ID, or nil when a
@@ -82,7 +63,7 @@ public final class SpaceCreator {
             log.error("Create Space: no Accessibility grant.")
             return nil
         }
-        guard let dock = dockElement() else {
+        guard let dock = MissionControl.dockElement() else {
             log.error("Create Space: the Dock does not run.")
             return nil
         }
@@ -96,21 +77,21 @@ public final class SpaceCreator {
         log.info("Create Space: display \(display.id.uuid, privacy: .public) has \(before.count, privacy: .public) Spaces.")
 
         // Step 2: open Mission Control, or reuse an open one.
-        let alreadyOpen = missionControlGroup(in: dock) != nil
+        let alreadyOpen = MissionControl.group(in: dock) != nil
         if alreadyOpen {
             log.info("Create Space: Mission Control is already open. The creator leaves it open.")
         } else {
-            toggleMissionControl()
+            MissionControl.toggle()
         }
-        let budget = Deadline(ms: Self.budgetMs)
+        let budget = MissionControl.Deadline(ms: Self.budgetMs)
 
         let created = await addSpace(on: display, dock: dock, known: known, budget: budget)
 
         // Step 7: close Mission Control only when this call opened it.
         if !alreadyOpen {
-            await closeMissionControl(dock: dock)
+            await MissionControl.close(dock: dock)
         }
-        await settle(display: display.id)
+        await MissionControl.settle(display: display.id)
 
         let currentAfter = SpaceReader.currentSpace(of: display.id, skyLight)
         if currentBefore != currentAfter {
@@ -130,10 +111,10 @@ public final class SpaceCreator {
     /// Waits for the Mission Control group, presses the add button, and
     /// waits for the new Space. Does not open or close Mission Control.
     private func addSpace(on display: DisplaySnapshot, dock: AXUIElement, known: Set<SpaceID>,
-                          budget: Deadline) async -> SpaceID? {
+                          budget: MissionControl.Deadline) async -> SpaceID? {
         // Step 3: the Mission Control group.
-        let group: AXUIElement? = await poll(everyMs: Self.axPollMs, capMs: Self.waitCapMs, budget: budget) {
-            self.missionControlGroup(in: dock)
+        let group: AXUIElement? = await MissionControl.poll(everyMs: MissionControl.axPollMs, capMs: MissionControl.waitCapMs, budget: budget) {
+            MissionControl.group(in: dock)
         }
         guard let group else {
             log.error("Create Space: Mission Control did not appear.")
@@ -143,7 +124,7 @@ public final class SpaceCreator {
 
         // Step 4: the add button of the display. The group can fill in a moment later.
         let shared = SpaceReader.sharedScreens.contains(display.id.uuid.uppercased())
-        let button: AXUIElement? = await poll(everyMs: Self.axPollMs, capMs: Self.waitCapMs, budget: budget) {
+        let button: AXUIElement? = await MissionControl.poll(everyMs: MissionControl.axPollMs, capMs: MissionControl.waitCapMs, budget: budget) {
             self.addButton(in: group, cgID: display.cgID, sharedSpaces: shared)
         }
         guard let button else {
@@ -159,7 +140,7 @@ public final class SpaceCreator {
         }
 
         // Step 6: wait until SkyLight lists the new Space.
-        let created: SpaceID? = await poll(everyMs: Self.skyLightPollMs, capMs: Self.waitCapMs, budget: budget) {
+        let created: SpaceID? = await MissionControl.poll(everyMs: MissionControl.skyLightPollMs, capMs: MissionControl.waitCapMs, budget: budget) {
             let now = SpaceReader.spaces(ofDisplay: display.id, self.skyLight) ?? []
             return now.last { $0.isUser && !known.contains($0.id) }?.id
         }
@@ -169,131 +150,17 @@ public final class SpaceCreator {
         return created
     }
 
-    // MARK: - Mission Control
-
-    /// Toggles Mission Control with `Mission Control.app`. It does not depend
-    /// on the keyboard shortcut. `activates` is false, so the focus stays.
-    private func toggleMissionControl() {
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = false
-        let log = self.log
-        NSWorkspace.shared.openApplication(at: Self.missionControlURL, configuration: configuration) { _, error in
-            if let error {
-                log.error("Create Space: Mission Control did not start: \(String(describing: error), privacy: .public)")
-            }
-        }
-    }
-
-    /// Closes Mission Control with the same toggle. When the group stays,
-    /// the function posts Escape once.
-    private func closeMissionControl(dock: AXUIElement) async {
-        guard missionControlGroup(in: dock) != nil else { return }
-        toggleMissionControl()
-        let gone: Bool? = await poll(everyMs: Self.axPollMs, capMs: Self.closeCapMs, budget: Deadline(ms: Self.closeCapMs)) {
-            self.missionControlGroup(in: dock) == nil ? true : nil
-        }
-        if gone == true { return }
-        log.warning("Create Space: Mission Control stays open after the toggle. Posting Escape.")
-        for down in [true, false] {
-            CGEvent(keyboardEventSource: nil, virtualKey: Self.escapeKeyCode, keyDown: down)?
-                .post(tap: .cghidEventTap)
-        }
-        let closed: Bool? = await poll(everyMs: Self.axPollMs, capMs: 500, budget: Deadline(ms: 500)) {
-            self.missionControlGroup(in: dock) == nil ? true : nil
-        }
-        if closed != true {
-            log.error("Create Space: Mission Control stays open. The user must close it.")
-        }
-    }
-
-    /// Waits until the close animation ends: a fixed pause, then until
-    /// SkyLight reports that the display does not animate.
-    private func settle(display: DisplayID) async {
-        try? await Task.sleep(nanoseconds: UInt64(Self.settleMs) * 1_000_000)
-        await SpaceReader.waitWhileAnimating(display, timeoutMs: 600)
-    }
-
     // MARK: - Accessibility
-
-    /// AX element of the Dock process, or nil when the Dock does not run.
-    private func dockElement() -> AXUIElement? {
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.dockBundleID).first
-        else { return nil }
-        let element = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(element, Self.axMessagingTimeout)
-        return element
-    }
-
-    /// Dock child with identifier `mc` (title "Mission Control"), or nil.
-    private func missionControlGroup(in dock: AXUIElement) -> AXUIElement? {
-        AXTree.children(dock).first { AXTree.string($0, "AXIdentifier") == Self.missionControlID }
-    }
 
     /// Button `mc.spaces.add` of the `mc.display` group for `cgID`.
     ///
     /// With shared Spaces ("Displays have separate Spaces" off), a display
     /// can lack its own group. Then any display group with the button works.
     private func addButton(in group: AXUIElement, cgID: CGDirectDisplayID, sharedSpaces: Bool) -> AXUIElement? {
-        let displays = AXTree.children(group).filter { AXTree.string($0, "AXIdentifier") == Self.displayGroupID }
-        let exact = displays.filter {
-            (AXTree.attribute($0, "AXDisplayID") as? NSNumber)?.uint32Value == cgID
-        }
-        let candidates = exact.isEmpty && sharedSpaces ? displays : exact
-        for display in candidates {
+        for display in MissionControl.displayGroups(in: group, cgID: cgID, sharedSpaces: sharedSpaces) {
             if let button = AXTree.find(identifier: Self.addButtonID, in: display, maxDepth: 4) {
                 return button
             }
-        }
-        return nil
-    }
-
-    // MARK: - Waiting
-
-    /// End of a time budget.
-    struct Deadline {
-        let end: Date
-        init(ms: Int) { end = Date().addingTimeInterval(Double(ms) / 1000) }
-        var remaining: TimeInterval { end.timeIntervalSinceNow }
-    }
-
-    /// Calls `body` now and then every `everyMs` until it returns a value.
-    /// Stops after `capMs` or when `budget` ends. Returns nil on a timeout.
-    private func poll<T>(everyMs: Int, capMs: Int, budget: Deadline,
-                         _ body: () -> T?) async -> T? {
-        let stop = min(Date().addingTimeInterval(Double(capMs) / 1000), budget.end)
-        while true {
-            if let value = body() { return value }
-            if Date() >= stop { return nil }
-            try? await Task.sleep(nanoseconds: UInt64(everyMs) * 1_000_000)
-        }
-    }
-}
-
-/// Small Accessibility reads. Each function returns nil or an empty value on an AX error.
-enum AXTree {
-    static func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
-        return value
-    }
-
-    static func string(_ element: AXUIElement, _ name: String) -> String? {
-        attribute(element, name) as? String
-    }
-
-    static func children(_ element: AXUIElement) -> [AXUIElement] {
-        attribute(element, kAXChildrenAttribute as String) as? [AXUIElement] ?? []
-    }
-
-    /// Breadth-first search for the first descendant with `AXIdentifier`
-    /// equal to `identifier`. The search goes at most `maxDepth` levels down.
-    static func find(identifier: String, in root: AXUIElement, maxDepth: Int) -> AXUIElement? {
-        var level = children(root)
-        var depth = 1
-        while !level.isEmpty, depth <= maxDepth {
-            if let hit = level.first(where: { string($0, "AXIdentifier") == identifier }) { return hit }
-            level = level.flatMap(children)
-            depth += 1
         }
         return nil
     }

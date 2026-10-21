@@ -380,6 +380,21 @@ public final class WindowEnumerator {
         Self.onScreenLayerZero().ids
     }
 
+    /// IDs of every layer-0 window on every Space, on screen or not.
+    /// Hidden and minimized windows are in the list.
+    nonisolated static func allLayerZeroIDs() -> [WindowID] {
+        let options: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+        return list.compactMap { info in
+            guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let number = info[kCGWindowNumber as String] as? NSNumber
+            else { return nil }
+            return WindowID(number.uint32Value)
+        }
+    }
+
     /// On-screen layer-0 window IDs and their owner pids.
     nonisolated static func onScreenLayerZero() -> (ids: Set<WindowID>, pids: Set<pid_t>, owners: [WindowID: pid_t]) {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]

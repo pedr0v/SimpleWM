@@ -389,6 +389,58 @@ public final class SpaceManager {
         SpaceReader.spaces(ofWindow: w, skyLight)
     }
 
+    /// Spaces that hold at least one window. Hidden and minimized windows
+    /// count. A window on several Spaces (sticky, "All Desktops") counts for
+    /// none of them. Only layer-0 windows count: menu bars, the Dock, and
+    /// desktop elements never keep a Space.
+    public func usedSpaces() -> Set<SpaceID> {
+        var used = Set<SpaceID>()
+        for w in WindowEnumerator.allLayerZeroIDs() {
+            let spaces = SpaceReader.spaces(ofWindow: w, skyLight)
+            if spaces.count == 1 { used.insert(spaces[0]) }
+        }
+        return used
+    }
+
+    /// Empty user Spaces of `display` that the app may remove.
+    ///
+    /// Rules:
+    /// - The first Space of the display stays.
+    /// - The current Space stays.
+    /// - A non-user Space (fullscreen app) stays.
+    /// - The last Space of the display stays, so one spare desktop remains.
+    /// - A Space with a window stays (`usedSpaces`).
+    public func emptySpaceCandidates(on display: DisplaySnapshot) -> [SpaceInfo] {
+        let used = usedSpaces()
+        let spaces = display.spaces
+        guard spaces.count > 1 else { return [] }
+        var out: [SpaceInfo] = []
+        for (i, s) in spaces.enumerated() {
+            guard i > 0, i < spaces.count - 1, s.isUser, s.id != display.current.id,
+                  !used.contains(s.id) else { continue }
+            out.append(s)
+        }
+        return out
+    }
+
+    /// Removes `ids` from `display` with `remover`. Holds the switch lock,
+    /// so a Space switch waits while Mission Control is open. Returns the
+    /// count of removed Spaces, or nil when the lock stays busy.
+    public func removeSpaces(_ ids: [SpaceID], on display: DisplaySnapshot, remover: SpaceRemover) async -> Int? {
+        guard !ids.isEmpty else { return 0 }
+        let waitUntil = Date().addingTimeInterval(8)
+        while switchBusy, Date() < waitUntil {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        guard !switchBusy else {
+            log.error("Remove Spaces: the switch lock stays busy. Request dropped.")
+            return nil
+        }
+        switchBusy = true
+        defer { switchBusy = false }
+        return await remover.removeSpaces(ids, on: display)
+    }
+
     /// Switches `display` to its Nth user Space (1-based). Does nothing when
     /// N exceeds the count. Never creates a Space: call `ensureSpaces` first.
     ///
