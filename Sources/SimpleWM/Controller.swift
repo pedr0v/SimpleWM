@@ -11,6 +11,8 @@ import os
 /// 3. `refresh()` reads displays, skips displays whose current Space is type 4,
 ///    collects tileable windows per display, reconciles each tree, computes
 ///    frames, and writes only frames that differ by more than 2 pt.
+///    A window that the user resized with the mouse first gives its new
+///    edges to the split weights (`TilingTree.fit`), as in i3.
 ///    A refresh waits while a Space switch or a Space animation runs, and for
 ///    one second after a screen change. A window joins the tree of a Space
 ///    only when SkyLight lists that Space as its only Space.
@@ -97,6 +99,9 @@ public final class WMController {
     private var lastWrite: [WindowID: FrameWrite] = [:]
     /// Window move and resize events of our own writes end here. They do not start a refresh.
     private var selfWriteUntil: [WindowID: Date] = [:]
+    /// Windows that the user resized with the mouse since the last refresh.
+    /// The next refresh changes the split weights to their frames.
+    private var userResized: Set<WindowID> = []
     /// Spaces that the last refresh missed in the SkyLight list. A tree goes
     /// only after two refreshes in a row miss its Space.
     private var missingSpaces: Set<SpaceID> = []
@@ -211,6 +216,7 @@ public final class WMController {
         windowCache = [:]
         lastWrite = [:]
         selfWriteUntil = [:]
+        userResized = []
         uncertainSince = [:]
         spaceGraceUntil = [:]
         previousSpace = [:]
@@ -344,7 +350,19 @@ public final class WMController {
             if let f = focused, ids.contains(f.id) {
                 state.update(key) { $0.setFocus(f.id) }
             }
+            fitUserResized(key, on: d)
             applyLayout(key, on: d)
+        }
+        userResized = []
+    }
+
+    /// Gives the live frames of user-resized windows in tree `key` to the
+    /// split weights. A window outside the tree (floating, other Space) does
+    /// not change the tree.
+    private func fitUserResized(_ key: SpaceKey, on d: DisplaySnapshot) {
+        for id in userResized where state.trees[key]?.contains(id) == true {
+            guard let live = windowCache[id]?.frame else { continue }
+            state.update(key) { $0.fit(id, to: live, in: d.workArea, gaps: config.gaps) }
         }
     }
 
@@ -487,6 +505,15 @@ public final class WMController {
             // Our own frame write causes these events. A refresh for them
             // would write the same frame again.
             if let id, let until = selfWriteUntil[id], Date() < until { return }
+            // Only a resize while the left mouse button is down counts as a
+            // user resize. macOS and apps also resize windows: after a screen
+            // change, at a minimum size, or late after our write. Those frames
+            // must not change the weights. A drag sends resize events while
+            // the button is down. The refresh waits for the mouse up and then
+            // reads the final frame.
+            if case .windowResized = event, let id, NSEvent.pressedMouseButtons & 0x1 != 0, tilingActive {
+                userResized.insert(id)
+            }
         case .screenParametersChanged:
             screenParametersChanged()
             return

@@ -112,6 +112,10 @@ bundle (`.build/debug/SimpleWM`) has no update item.
 | `alt-comma` / `alt-period` | `focus-monitor left/right` | Move focus to the display on that side. |
 | `alt-shift-comma` / `alt-shift-period` | `move-to-monitor left/right` | Move the window to the display on that side. |
 
+Drag the edge of a tiled window with the mouse to resize its split, as in
+i3. The new size stays after the mouse up. `alt-shift-minus` and
+`alt-shift-equal` do the same from the keyboard.
+
 `N` follows the Mission Control order of the focused display. A fullscreen
 app counts as one Space. `move-to-space N` only targets a normal desktop.
 

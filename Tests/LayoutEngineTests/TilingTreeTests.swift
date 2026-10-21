@@ -558,6 +558,106 @@ final class TilingTreeTests: XCTestCase {
         XCTAssertEqual(t, before)
     }
 
+    // MARK: Fit to a user frame
+
+    func testFitMovesInnerEdgeOfTwoWindows() {
+        let wide = Rect(x: 0, y: 0, w: 1000, h: 500)
+        var t = tree(1, 2)
+        t.fit(w(1), to: Rect(x: 0, y: 0, w: 700, h: 500), in: wide, gaps: .none)
+        let f = t.layout(in: wide, gaps: .none)
+        XCTAssertEqual(f[w(1)], Rect(x: 0, y: 0, w: 700, h: 500))
+        XCTAssertEqual(f[w(2)], Rect(x: 700, y: 0, w: 300, h: 500))
+        assertConsistent(t)
+    }
+
+    /// Returns the tree [1, V(2, 3)]: window 1 on the left, windows 2 and 3
+    /// stacked on the right.
+    private func leftAndStack() -> TilingTree {
+        var t = tree(1, 2)
+        t.split(.vertical)
+        t.insert(w(3))
+        return t
+    }
+
+    func testFitMovesEdgeInNestedContainer() {
+        var t = leftAndStack()
+        XCTAssertEqual(frames(t)[w(2)], Rect(x: 500, y: 0, w: 500, h: 300))
+        t.fit(w(2), to: Rect(x: 500, y: 0, w: 500, h: 400), in: area, gaps: .none)
+        let f = frames(t)
+        XCTAssertEqual(f[w(1)], Rect(x: 0, y: 0, w: 500, h: 600))
+        XCTAssertEqual(f[w(2)], Rect(x: 500, y: 0, w: 500, h: 400))
+        XCTAssertEqual(f[w(3)], Rect(x: 500, y: 400, w: 500, h: 200))
+        assertConsistent(t)
+    }
+
+    func testFitGivesEdgeToAncestorWithThatAxis() {
+        var t = leftAndStack()
+        t.fit(w(3), to: Rect(x: 400, y: 300, w: 600, h: 300), in: area, gaps: .none)
+        let f = frames(t)
+        XCTAssertEqual(f[w(1)], Rect(x: 0, y: 0, w: 400, h: 600))
+        XCTAssertEqual(f[w(2)], Rect(x: 400, y: 0, w: 600, h: 300))
+        XCTAssertEqual(f[w(3)], Rect(x: 400, y: 300, w: 600, h: 300))
+        assertConsistent(t)
+    }
+
+    func testFitClampsAtMinimumWeight() {
+        var t = tree(1, 2)
+        t.fit(w(1), to: Rect(x: 0, y: 0, w: 990, h: 600), in: area, gaps: .none)
+        let f = frames(t)
+        XCTAssertEqual(f[w(1)]?.w, 950)
+        XCTAssertEqual(f[w(2)], Rect(x: 950, y: 0, w: 50, h: 600), "sibling keeps 5%")
+        assertConsistent(t)
+    }
+
+    func testFitLoneWindowDoesNothing() {
+        var t = tree(1)
+        let before = t
+        t.fit(w(1), to: Rect(x: 100, y: 100, w: 300, h: 200), in: area, gaps: .none)
+        XCTAssertEqual(t, before)
+        XCTAssertEqual(frames(t), [w(1): area])
+    }
+
+    func testFitIgnoresOtherAxis() {
+        var t = tree(1, 2)
+        let before = t
+        t.fit(w(1), to: Rect(x: 0, y: 0, w: 500, h: 400), in: area, gaps: .none)
+        XCTAssertEqual(t, before)
+    }
+
+    func testFitKeepsInnerGap() {
+        let gaps = Gaps(inner: 10, outer: 0)
+        var t = tree(1, 2)
+        XCTAssertEqual(frames(t, gaps: gaps)[w(1)], Rect(x: 0, y: 0, w: 495, h: 600))
+        t.fit(w(1), to: Rect(x: 0, y: 0, w: 695, h: 600), in: area, gaps: gaps)
+        let f = frames(t, gaps: gaps)
+        XCTAssertEqual(f[w(1)], Rect(x: 0, y: 0, w: 695, h: 600))
+        XCTAssertEqual(f[w(2)], Rect(x: 705, y: 0, w: 295, h: 600))
+    }
+
+    func testFitUsesOuterGap() {
+        let gaps = Gaps(inner: 10, outer: 20)
+        var t = tree(1, 2)
+        XCTAssertEqual(frames(t, gaps: gaps)[w(2)], Rect(x: 505, y: 20, w: 475, h: 560))
+        t.fit(w(2), to: Rect(x: 405, y: 20, w: 575, h: 560), in: area, gaps: gaps)
+        let f = frames(t, gaps: gaps)
+        XCTAssertEqual(f[w(1)], Rect(x: 20, y: 20, w: 375, h: 560))
+        XCTAssertEqual(f[w(2)], Rect(x: 405, y: 20, w: 575, h: 560))
+    }
+
+    func testFitIgnoresAbsentZoomedAndEmptyArea() {
+        var t = tree(1, 2)
+        let before = t
+        t.fit(w(9), to: Rect(x: 0, y: 0, w: 700, h: 600), in: area, gaps: .none)
+        XCTAssertEqual(t, before, "a window outside the tree changes nothing")
+        t.fit(w(1), to: Rect(x: 0, y: 0, w: 700, h: 600), in: .zero, gaps: .none)
+        XCTAssertEqual(t, before, "zero free length changes nothing")
+        t.setFocus(w(1))
+        t.toggleZoom()
+        let zoomed = t
+        t.fit(w(1), to: Rect(x: 0, y: 0, w: 700, h: 600), in: area, gaps: .none)
+        XCTAssertEqual(t, zoomed, "a zoomed window changes nothing")
+    }
+
     // MARK: Insert and remove are inverses
 
     func testRemoveUndoesInsertWeights() {

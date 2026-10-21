@@ -73,6 +73,10 @@ public struct Container: Equatable, Sendable {
 /// - balance: every container gets equal weights.
 /// - resize(delta): adds `delta` (fraction of the parent) to the focused leaf
 ///   weight and removes it from the next sibling. Weights stay >= 0.05.
+/// - fit(w, to: frame): the user gave window `w` a new frame with the mouse.
+///   Each moved edge goes to the nearest ancestor that splits along that axis
+///   and has a sibling on that side. That container moves the edge between
+///   the two children. Outer edges and a zoomed leaf do not change.
 /// - layout: splits rectangles by weights. Inner gap lies between siblings.
 ///   Outer gap lies between the root and the work area. Frames are rounded
 ///   to whole points.
@@ -322,10 +326,7 @@ public struct TilingTree: Equatable, Sendable {
               let c = container(p), c.children.count >= 2,
               let i = c.children.firstIndex(of: leaf) else { return }
         let j = i + 1 < c.children.count ? i + 1 : i - 1
-        let total = c.weights.reduce(0, +)
-        var ws = total > 0
-            ? c.weights.map { $0 / total }
-            : Array(repeating: 1 / Double(c.children.count), count: c.children.count)
+        var ws = Self.normalized(c.weights)
         var change = delta
         if change > 0 {
             change = max(0, min(change, ws[j] - Self.minWeight))
@@ -335,6 +336,59 @@ public struct TilingTree: Equatable, Sendable {
         ws[i] += change
         ws[j] -= change
         modifyContainer(p) { $0.weights = ws }
+    }
+
+    /// Changes weights so that the leaf of `w` takes the edges of `frame`.
+    /// See type rules.
+    ///
+    /// `frame` is the frame that the user gave the window with the mouse.
+    /// `area` and `gaps` must be the values of the last `layout` call. The
+    /// engine compares `frame` with the layout rect of the leaf:
+    /// - An edge that moved by more than 1 pt goes to the nearest ancestor
+    ///   that splits along that axis and has a sibling on that side.
+    /// - That container moves the edge between the two children. The pair
+    ///   keeps its weight sum. No child goes below the minimum weight.
+    /// - A container ignores edges on the other axis.
+    /// - An edge on the root edge does not change. A zoomed leaf does not change.
+    public mutating func fit(_ w: WindowID, to frame: Rect, in area: Rect, gaps: Gaps) {
+        guard zoomed != w, let leaf = leafID(of: w) else { return }
+        var rects: [NodeID: Rect] = [:]
+        placeNodes(root, in: area.inset(by: gaps.outer), inner: gaps.inner, into: &rects)
+        guard let old = rects[leaf] else { return }
+        // The nearest container that owns an edge takes it. A higher
+        // container does not take the same edge again.
+        var ownedMin: Set<Orientation> = []
+        var ownedMax: Set<Orientation> = []
+        var child = leaf
+        while let p = parents[child], let c = container(p), let pr = rects[p] {
+            let o = c.orientation
+            let n = c.children.count
+            if n >= 2, let k = c.children.firstIndex(of: child), let r = rects[child] {
+                let free = pr.length(along: o) - gaps.inner * Double(n - 1)
+                var shares = Self.normalized(c.weights)
+                var changed = false
+                if k > 0, !ownedMin.contains(o), abs(old.low(along: o) - r.low(along: o)) <= 1 {
+                    ownedMin.insert(o)
+                    let delta = frame.low(along: o) - old.low(along: o)
+                    if abs(delta) > 1, free > 0 {
+                        // A positive delta moves the edge toward the end. The previous sibling grows.
+                        Self.transfer(&shares, from: k, to: k - 1, delta / free)
+                        changed = true
+                    }
+                }
+                if k < n - 1, !ownedMax.contains(o), abs(old.high(along: o) - r.high(along: o)) <= 1 {
+                    ownedMax.insert(o)
+                    let delta = frame.high(along: o) - old.high(along: o)
+                    if abs(delta) > 1, free > 0 {
+                        // A positive delta moves the edge toward the end. The child of the leaf grows.
+                        Self.transfer(&shares, from: k + 1, to: k, delta / free)
+                        changed = true
+                    }
+                }
+                if changed { modifyContainer(p) { $0.weights = shares } }
+            }
+            child = p
+        }
     }
 
     /// Computes a frame for every window inside `area`.
@@ -359,6 +413,26 @@ extension TilingTree {
     /// Returns the mean of `weights`, or 1 when `weights` is empty.
     static func equalShare(_ weights: [Double]) -> Double {
         weights.isEmpty ? 1 : weights.reduce(0, +) / Double(weights.count)
+    }
+
+    /// Returns `weights` scaled to a sum of 1. A sum of 0 gives equal shares.
+    static func normalized(_ weights: [Double]) -> [Double] {
+        let total = weights.reduce(0, +)
+        guard total > 0 else {
+            return Array(repeating: 1 / Double(max(1, weights.count)), count: weights.count)
+        }
+        return weights.map { $0 / total }
+    }
+
+    /// Moves `amount` of share from child `j` to child `i`. A negative amount
+    /// moves share from `i` to `j`. The pair keeps its sum. A share that is
+    /// above `minWeight` does not go below it.
+    static func transfer(_ shares: inout [Double], from j: Int, to i: Int, _ amount: Double) {
+        let most = max(0, shares[j] - minWeight)
+        let least = -max(0, shares[i] - minWeight)
+        let a = min(most, max(least, amount))
+        shares[i] += a
+        shares[j] -= a
     }
 
     /// Rounds each edge to a whole point. Adjacent frames keep a shared edge.
@@ -615,25 +689,54 @@ extension TilingTree {
         case .window(let w)?:
             out[w] = rect
         case .container(let c)?:
-            let n = c.children.count
-            guard n > 0 else { return }
-            let horizontal = c.orientation == .horizontal
-            let length = horizontal ? rect.w : rect.h
-            let free = max(0, length - inner * Double(n - 1))
-            let positive = c.weights.map { max(0, $0) }
-            let total = positive.reduce(0, +)
-            let shares = total > 0 ? positive.map { $0 / total } : Array(repeating: 1 / Double(n), count: n)
-            var cursor = horizontal ? rect.x : rect.y
-            for (k, child) in c.children.enumerated() {
-                let size = free * shares[k]
-                let r = horizontal
-                    ? Rect(x: cursor, y: rect.y, w: size, h: rect.h)
-                    : Rect(x: rect.x, y: cursor, w: rect.w, h: size)
+            for (child, r) in zip(c.children, Self.childRects(of: c, in: rect, inner: inner)) {
                 place(child, in: r, inner: inner, into: &out)
-                cursor += size + inner
             }
         case nil:
             break
         }
     }
+
+    /// Records the rect of every node of the subtree `id`: leaves and
+    /// containers. The math is the same as in `place`. Rects are not rounded.
+    private func placeNodes(_ id: NodeID, in rect: Rect, inner: Double, into out: inout [NodeID: Rect]) {
+        out[id] = rect
+        guard let c = container(id) else { return }
+        for (child, r) in zip(c.children, Self.childRects(of: c, in: rect, inner: inner)) {
+            placeNodes(child, in: r, inner: inner, into: &out)
+        }
+    }
+
+    /// Returns the rect of each child of `c` inside `rect`, in child order.
+    /// Children share the length along the orientation by weight, minus
+    /// `inner` between them.
+    private static func childRects(of c: Container, in rect: Rect, inner: Double) -> [Rect] {
+        let n = c.children.count
+        guard n > 0 else { return [] }
+        let horizontal = c.orientation == .horizontal
+        let length = horizontal ? rect.w : rect.h
+        let free = max(0, length - inner * Double(n - 1))
+        let positive = c.weights.map { max(0, $0) }
+        let total = positive.reduce(0, +)
+        let shares = total > 0 ? positive.map { $0 / total } : Array(repeating: 1 / Double(n), count: n)
+        var cursor = horizontal ? rect.x : rect.y
+        var out: [Rect] = []
+        for share in shares {
+            let size = free * share
+            out.append(horizontal
+                ? Rect(x: cursor, y: rect.y, w: size, h: rect.h)
+                : Rect(x: rect.x, y: cursor, w: rect.w, h: size))
+            cursor += size + inner
+        }
+        return out
+    }
+}
+
+private extension Rect {
+    /// Start edge along `o`: the left edge or the top edge.
+    func low(along o: Orientation) -> Double { o == .horizontal ? minX : minY }
+    /// End edge along `o`: the right edge or the bottom edge.
+    func high(along o: Orientation) -> Double { o == .horizontal ? maxX : maxY }
+    /// Width or height along `o`.
+    func length(along o: Orientation) -> Double { o == .horizontal ? w : h }
 }
