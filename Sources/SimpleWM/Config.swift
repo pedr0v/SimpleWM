@@ -24,7 +24,8 @@ public struct Config: Codable, Equatable {
     /// When true, the app removes an empty desktop that is not the first,
     /// not the current, and not the last one of its display. One spare
     /// empty desktop stays at the end, as in Mission Control.
-    public var removeEmptySpaces: Bool = true
+    /// Off by default: the Mission Control action is experimental.
+    public var removeEmptySpaces: Bool = false
     public var spaceSwitch: SpaceSwitch = SpaceSwitch()
     public var floatingApps: [String] = ["com.apple.systempreferences"]
     /// When true, a window without a usable zoom button floats. Settings

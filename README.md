@@ -6,8 +6,6 @@ macOS Spaces.
 - `Option+1..9` switches the focused display to its Nth native Space.
 - `Option+Shift+1..9` moves the focused window to Space N of its display.
 - When Space N does not exist, the app creates desktops until it does.
-- An empty desktop goes away on its own, as an empty i3 workspace does.
-  One spare empty desktop stays at the end of each display.
 - The app tiles the windows of each normal Space in an i3-style split tree.
 - Floating windows stay floating. Settings panels, dialogs, and windows
   without a zoom button keep their own size and position.
@@ -127,11 +125,12 @@ and then switches to Space N (`space N`) or moves the window there
 creates at most 9 Spaces on a display. Set `createMissingSpaces` to `false`
 to turn this off. Then a key for a missing Space does nothing.
 
-When a desktop has no window, the app removes it about 1.5 s later. The
-first desktop, the current desktop, a fullscreen app, and the last desktop
-of a display always stay. So one empty desktop remains at the end, as in
-Mission Control. A window on "All Desktops" keeps no desktop. Set
-`removeEmptySpaces` to `false` to turn this off.
+Experimental: with `removeEmptySpaces` set to `true`, the app removes a
+desktop that has no window about 1.5 s later. The first desktop, the
+current desktop, a fullscreen app, and the last desktop of a display always
+stay. So one empty desktop remains at the end, as in Mission Control. A
+window on "All Desktops" keeps no desktop. The option is off by default.
+After 3 failed passes the app stops cleanup until a restart.
 
 Key codes are physical. The keyboard layout (for example ABNT2) does not
 change the bindings.
@@ -157,7 +156,7 @@ Config" to apply it.
     "alt-shift-equal" : "resize 0.05"
   },
   "createMissingSpaces" : true,
-  "removeEmptySpaces" : true,
+  "removeEmptySpaces" : false,
   "floatingApps" : [
     "com.apple.systempreferences"
   ],
@@ -189,9 +188,9 @@ Keys:
 - `createMissingSpaces`: when `true` (default), `space N` and
   `move-to-space N` create desktops on the focused display until it has N
   Spaces. When `false`, a key for a missing Space does nothing.
-- `removeEmptySpaces`: when `true` (default), the app removes an empty
-  desktop that is not the first, the current, or the last one of its
-  display. Removal opens Mission Control for a moment.
+- `removeEmptySpaces`: experimental, `false` by default. When `true`, the
+  app removes an empty desktop that is not the first, the current, or the
+  last one of its display. Removal opens Mission Control for a moment.
 - `floatingApps`: bundle IDs that the app never tiles.
 - `floatWindowsWithoutZoom`: when `true` (default), a window without an
   enabled zoom button floats. System Settings and most utility panels have

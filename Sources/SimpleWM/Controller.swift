@@ -77,6 +77,14 @@ public final class WMController {
     private var cleanupTask: Task<Void, Never>?
     /// Delay between the last refresh and a cleanup pass.
     static let cleanupDelayMs: UInt64 = 1500
+    /// Candidate IDs of the last failed cleanup pass. The next pass runs
+    /// only when the candidates differ, so a failure does not repeat on
+    /// every refresh.
+    private var cleanupFailedFor: Set<SpaceID> = []
+    /// Count of failed cleanup passes. After `cleanupMaxFailures` the app
+    /// stops cleanup until a restart.
+    private var cleanupFailures = 0
+    static let cleanupMaxFailures = 3
     private var timer: Timer?
     /// AX windows from the last refresh, by ID.
     private var windowCache: [WindowID: AXWindow] = [:]
@@ -223,6 +231,8 @@ public final class WMController {
         refreshTask = nil
         cleanupTask?.cancel()
         cleanupTask = nil
+        cleanupFailedFor = []
+        cleanupFailures = 0
         windowCache = [:]
         lastWrite = [:]
         selfWriteUntil = [:]
@@ -377,7 +387,8 @@ public final class WMController {
     /// closed. One spare empty desktop stays on each display. See
     /// `SpaceManager.emptySpaceCandidates(on:)` for the rules.
     private func scheduleSpaceCleanup() {
-        guard enabled, config.removeEmptySpaces, !dryRun else { return }
+        guard enabled, config.removeEmptySpaces, !dryRun,
+              cleanupFailures < Self.cleanupMaxFailures else { return }
         cleanupTask?.cancel()
         cleanupTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: Self.cleanupDelayMs * 1_000_000)
@@ -399,11 +410,19 @@ public final class WMController {
             let candidates = spaceManager.emptySpaceCandidates(on: d)
             guard !candidates.isEmpty else { continue }
             let ids = candidates.map(\.id)
+            // A failed pass does not repeat for the same Spaces.
+            guard Set(ids) != cleanupFailedFor else { continue }
             log.info("Empty Spaces on \(d.id.uuid, privacy: .public): \(ids.count, privacy: .public). Removing.")
             guard let removed = await spaceManager.removeSpaces(ids, on: d, remover: spaceRemover) else { continue }
             if removed < ids.count {
+                cleanupFailedFor = Set(ids)
+                cleanupFailures += 1
+                if cleanupFailures >= Self.cleanupMaxFailures {
+                    log.error("Remove empty Spaces failed \(self.cleanupFailures, privacy: .public) times. Cleanup is off until restart.")
+                }
                 recordSwitch(false, what: "remove empty Spaces", reason: "The app could not remove every empty Space.")
             } else {
+                cleanupFailedFor = []
                 recordSwitch(true, what: "remove empty Spaces")
             }
             for s in candidates.prefix(removed) {

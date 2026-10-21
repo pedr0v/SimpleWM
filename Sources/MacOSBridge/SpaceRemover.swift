@@ -131,6 +131,8 @@ public final class SpaceRemover {
             let thumbnail = children[index]
             guard AXTree.actions(thumbnail).contains(Self.removeAction) else {
                 log.error("Remove Space: the thumbnail has no \(Self.removeAction, privacy: .public) action.")
+                log.error("Remove Space: thumbnail tree:\n\(AXTree.dump(thumbnail, maxDepth: 3), privacy: .public)")
+                log.error("Remove Space: list tree:\n\(AXTree.dump(list, maxDepth: 1), privacy: .public)")
                 break
             }
             let status = AXUIElementPerformAction(thumbnail, Self.removeAction as CFString)

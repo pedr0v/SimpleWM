@@ -155,6 +155,26 @@ enum AXTree {
         return names as? [String] ?? []
     }
 
+    /// Text dump of `root` and its descendants, one line per element:
+    /// identifier, role, subrole, description, actions. For diagnostics.
+    static func dump(_ root: AXUIElement, maxDepth: Int, depth: Int = 0) -> String {
+        let pad = String(repeating: "  ", count: depth)
+        let fields = [
+            string(root, "AXIdentifier").map { "id=\($0)" },
+            string(root, kAXRoleAttribute as String).map { "role=\($0)" },
+            string(root, kAXSubroleAttribute as String).map { "subrole=\($0)" },
+            string(root, kAXDescriptionAttribute as String).map { "desc=\($0)" },
+            string(root, kAXTitleAttribute as String).map { "title=\($0)" },
+        ].compactMap { $0 }
+        var line = pad + fields.joined(separator: " ") + " actions=" + actions(root).joined(separator: ",")
+        if depth < maxDepth {
+            for child in children(root) {
+                line += "\n" + dump(child, maxDepth: maxDepth, depth: depth + 1)
+            }
+        }
+        return line
+    }
+
     /// Breadth-first search for the first descendant with `AXIdentifier`
     /// equal to `identifier`. The search goes at most `maxDepth` levels down.
     static func find(identifier: String, in root: AXUIElement, maxDepth: Int) -> AXUIElement? {
