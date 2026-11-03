@@ -36,6 +36,7 @@ let package = Package(
             ]
         ),
         .testTarget(name: "LayoutEngineTests", dependencies: ["LayoutEngine"]),
+        .testTarget(name: "MacOSBridgeTests", dependencies: ["MacOSBridge"]),
     ],
     swiftLanguageVersions: [.v5]
 )

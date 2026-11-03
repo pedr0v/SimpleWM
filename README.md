@@ -14,7 +14,7 @@ The app uses real Spaces. It does not emulate workspaces (AeroSpace does).
 It keeps SIP on. It loads private SkyLight functions with `dlsym`. Each
 private function is optional: a missing function disables one feature only.
 
-Requirements: macOS 14 or later (tested on macOS 26.1). To build from source: Xcode 16 or later.
+Requirements: macOS 14 or later (tested on macOS 26.1 and 27.2). To build from source: Xcode 16 or later.
 
 ## Install
 
@@ -260,7 +260,9 @@ log stream --predicate 'subsystem == "com.simplewm.app"' --level debug
 ```
 
 At startup the app logs the displays, their UUIDs, the current Space of
-each display, the user-Space count, and the Accessibility grant.
+each display, the user-Space count, the Accessibility grant, the
+event-posting grant, and the Dock swipe mode (`payload (macOS 27+)` or
+`legacy`).
 
 Run a dry run to read these logs without tiling. The app registers the
 hotkeys but does not change window frames:
@@ -284,5 +286,14 @@ SIMPLEWM_DRY_RUN=1 .build/debug/SimpleWM
   not `false`, that Accessibility is granted, and that N is at most 9. Read
   the log of the `spaces` category: it names the step that failed (Mission
   Control did not open, no add button, no new Space).
+- **`space N` does not switch, log shows "Event posting allowed: false".**
+  The app does not have the event-posting grant. WindowServer then logs
+  "Sender is prohibited from synthesizing events". macOS gives this grant
+  together with Accessibility. Check SimpleWM in System Settings > Privacy &
+  Security (Accessibility, or "Device Control and Data Access"). Restart the
+  app after a grant.
+- **`space N` moves the wrong way after a change of Natural scrolling.** The
+  Dock reads Natural scrolling only at launch. Run `killall Dock` after a
+  change of that setting.
 - **Windows do not tile after a rebuild.** The ad-hoc signature changed.
   Reset the grant with `tccutil` (see Install).

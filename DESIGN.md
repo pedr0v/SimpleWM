@@ -75,15 +75,39 @@ Verification polls `SLSManagedDisplayGetCurrentSpace` every 30 ms. The wait is
 600 ms. `GestureSwitch` waits 300 ms plus 250 ms per step instead, at least
 600 ms.
 
-1. `GestureSwitch`: synthetic Dock swipe (yabai v7.1.19). Warp the cursor to
-   the target display. Post one swipe per step over the full `Spaces[]`
-   list. Verify. When the target is not reached, wait until the display
-   stops (not animating, same Space for three polls 100 ms apart). Only then
-   recompute steps and start round 2 (at most two rounds). A burst of swipes
-   reports each hop as the current Space, so round 2 never reads a hop in the
-   middle. Restore cursor. With `warpCursor` false, the event location points
-   at the target display. The Dock can ignore it, so a round that moves
-   nothing makes the next round warp the cursor.
+1. `GestureSwitch`: synthetic Dock swipe. Warp the cursor to the target
+   display. Post one swipe per step over the full `Spaces[]` list. The swipe
+   has two forms:
+   - macOS 27 and later (`DockSwipeEvent`): macOS 27 ignores a swipe that has
+     only the classic CGEvent fields. Each event also carries a serialized
+     IOHID payload in the private CGEvent field 4205. One step is three
+     events: began, changed, ended. Each event sets progress `s * 0.1`. Only
+     the ended event sets velocity `s * 9999` and a velocity record in the
+     payload. The sign `s` of a forward move (higher index in `Spaces[]`) is
+     -1 with Natural scrolling and +1 without it. A backward move uses the
+     opposite sign. The strategy reads Natural scrolling on each request.
+     The strategy builds all events of the request first. When one event
+     fails, it posts nothing: a truncated sequence leaves the Dock in the
+     middle of a swipe. The gate reads the major version from
+     `kern.osproductversion`. `SIMPLEWM_SWIPE_PAYLOAD=1` or `0` forces the
+     form on or off.
+   - macOS 26 and earlier (yabai v7.1.19): one began and one ended event per
+     step. Progress is `s` and velocity is `s * 9999` on both events. A
+     forward move has the sign +1.
+
+   The posted sign is the base sign of the form times `directionFactor`. The
+   strategy flips `directionFactor` when a round moves the wrong way. On
+   macOS 27, a Dock restart or a change of Natural scrolling resets
+   `directionFactor` to 1. The macOS 27 form keeps the real cursor location
+   in the events.
+
+   Verify. When the target is not reached, wait until the display stops (not
+   animating, same Space for three polls 100 ms apart). Only then recompute
+   steps and start round 2 (at most two rounds). A burst of swipes reports
+   each hop as the current Space, so round 2 never reads a hop in the middle.
+   Restore cursor. With `warpCursor` false, the legacy form points the event
+   location at the target display. The Dock can ignore it, so a round that
+   moves nothing makes the next round warp the cursor.
 2. `ControlKeySwitch`: post Ctrl+N. Runs only when "Switch to Desktop N" is
    enabled (`com.apple.symbolichotkeys` IDs 118..126). Verify.
 3. Failure: log and show `sWM!` in the menu bar.
