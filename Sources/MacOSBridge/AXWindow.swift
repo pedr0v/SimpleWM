@@ -381,8 +381,9 @@ public final class WindowEnumerator {
     }
 
     /// IDs of every layer-0 window on every Space, on screen or not.
-    /// Hidden and minimized windows are in the list.
-    nonisolated static func allLayerZeroIDs() -> [WindowID] {
+    /// Hidden and minimized windows are in the list. Windows of the
+    /// processes in `excludingOwners` are not in the list.
+    nonisolated static func allLayerZeroIDs(excludingOwners: Set<pid_t> = []) -> [WindowID] {
         let options: CGWindowListOption = [.optionAll, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
             return []
@@ -391,6 +392,10 @@ public final class WindowEnumerator {
             guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                   let number = info[kCGWindowNumber as String] as? NSNumber
             else { return nil }
+            if let owner = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+               excludingOwners.contains(owner) {
+                return nil
+            }
             return WindowID(number.uint32Value)
         }
     }

@@ -413,8 +413,8 @@ public final class WMController {
             // A failed pass does not repeat for the same Spaces.
             guard Set(ids) != cleanupFailedFor else { continue }
             log.info("Empty Spaces on \(d.id.uuid, privacy: .public): \(ids.count, privacy: .public). Removing.")
-            guard let removed = await spaceManager.removeSpaces(ids, on: d, remover: spaceRemover) else { continue }
-            if removed < ids.count {
+            guard let result = await spaceManager.removeSpaces(ids, on: d, remover: spaceRemover) else { continue }
+            if result.failed {
                 cleanupFailedFor = Set(ids)
                 cleanupFailures += 1
                 if cleanupFailures >= Self.cleanupMaxFailures {
@@ -425,8 +425,8 @@ public final class WMController {
                 cleanupFailedFor = []
                 recordSwitch(true, what: "remove empty Spaces")
             }
-            for s in candidates.prefix(removed) {
-                state.trees[SpaceKey(display: d.id, space: s.id)] = nil
+            for id in result.removed {
+                state.trees[SpaceKey(display: d.id, space: id)] = nil
             }
             // One display per pass: the list of the others can shift.
             scheduleRefresh()
@@ -652,6 +652,7 @@ public final class WMController {
     /// Runs one user command.
     public func run(_ command: Command) {
         guard enabled else { return }
+        log.debug("Command: \(String(describing: command), privacy: .public)")
         switch command {
         case .gotoSpace(let n):
             gotoSpace(n)
@@ -710,9 +711,12 @@ public final class WMController {
             log.info("back-and-forth: the previous Space does not exist now.")
             return
         }
+        // The ticket belongs to the key press. A running creation or switch
+        // cannot replace this request later.
+        let ticket = spaceManager.reserveSwitch()
         Task { [weak self] in
             guard let self else { return }
-            let ok = await self.spaceManager.switchTo(userSpace: index + 1, on: d)
+            let ok = await self.spaceManager.switchTo(userSpace: index + 1, on: d, ticket: ticket)
             self.recordSpaceSwitch(ok, what: "back-and-forth")
             self.scheduleRefresh()
         }
@@ -742,51 +746,82 @@ public final class WMController {
             log.error("space \(n, privacy: .public): no display found.")
             return
         }
-        let all = d.spaces
-        guard n >= 1 else { return }
-        let missing = n > all.count
-        if missing {
-            guard canCreateSpaces(upTo: n) else {
-                log.info("space \(n, privacy: .public): the display has \(all.count, privacy: .public) Spaces.")
-                return
-            }
-        } else if all[n - 1].id == d.current.id {
+        log.debug("space \(n, privacy: .public): display \(d.id.uuid, privacy: .public), current Space \(d.current.id.description, privacy: .public), \(d.spaces.count, privacy: .public) Spaces.")
+        switch spaceTarget(n, on: d, what: "space \(n)") {
+        case nil:
             return
-        }
-        Task { [weak self] in
-            guard let self else { return }
-            var display = d
-            if missing {
-                guard let fresh = await self.createMissingSpaces(upTo: n, on: d, what: "space \(n)") else { return }
-                display = fresh
+        case .existing(let index)?:
+            // A running creation or switch makes `d.current` old. Then the
+            // manager reads the display again. The new request also replaces
+            // an older request that still waits.
+            guard d.spaces[index].id != d.current.id || spaceManager.isSwitching else { return }
+            // The ticket belongs to the key press. A creation that ends later
+            // cannot replace this request.
+            let ticket = spaceManager.reserveSwitch()
+            Task { [weak self] in
+                guard let self else { return }
+                let ok = await self.spaceManager.switchTo(userSpace: n, on: d, ticket: ticket)
+                self.recordSpaceSwitch(ok, what: "space \(n)")
+                self.scheduleRefresh()
             }
-            let ok = await self.spaceManager.switchTo(userSpace: n, on: display)
-            self.recordSpaceSwitch(ok, what: "space \(n)")
-            self.scheduleRefresh()
+        case .spare?:
+            // The creation takes time. A newer key press during the creation
+            // takes a newer ticket, and the switch below does not run.
+            let ticket = spaceManager.reserveSwitch()
+            Task { [weak self] in
+                guard let self,
+                      let spare = await self.spareSpace(on: d, what: "space \(n)") else { return }
+                let ok = await self.spaceManager.switchTo(userSpace: spare.index + 1, on: spare.display, ticket: ticket)
+                self.recordSpaceSwitch(ok, what: "space \(n)")
+                self.scheduleRefresh()
+            }
         }
     }
 
-    /// True when the app may create Spaces up to `n`: the config allows it
-    /// and `n` is not above the cap of `SpaceManager.maxSpaceCount`.
-    private func canCreateSpaces(upTo n: Int) -> Bool {
-        config.createMissingSpaces && n <= SpaceManager.maxSpaceCount
+    /// Target of a Space command that runs. `existing` holds an index into
+    /// `Spaces[]`. `spare` is the empty desktop at the end of the display.
+    private enum CommandTarget {
+        case existing(index: Int)
+        case spare
     }
 
-    /// Creates desktops on `d` until it has `n` Spaces. Returns the fresh
-    /// snapshot, or nil after a failure. A failure sets the menu bar warning.
-    /// A success does not touch the warning: only the later switch or move does.
-    private func createMissingSpaces(upTo n: Int, on d: DisplaySnapshot, what: String) async -> DisplaySnapshot? {
-        guard let fresh = await spaceManager.ensureSpaces(count: n, on: d, creator: spaceCreator) else {
-            recordSwitch(false, what: what, reason: "The app could not create the missing Spaces.")
+    /// Target of `space N` or `move-to-space N` on `d`, or nil when the
+    /// command does nothing. Logs the reason for nil. See `SpaceTargetRules`.
+    private func spaceTarget(_ n: Int, on d: DisplaySnapshot, what: String) -> CommandTarget? {
+        let target = SpaceTargetRules.target(n: n, count: d.spaces.count,
+                                             createAllowed: config.createMissingSpaces,
+                                             maxCount: SpaceManager.maxSpaceCount)
+        switch target {
+        case .existing(let index):
+            return .existing(index: index)
+        case .spare:
+            return .spare
+        case .unavailable(.invalidNumber):
+            return nil
+        case .unavailable(.creationOff):
+            log.info("\(what, privacy: .public): the display has \(d.spaces.count, privacy: .public) Spaces. createMissingSpaces is off.")
+            return nil
+        case .unavailable(.aboveCap):
+            log.info("\(what, privacy: .public): the display has \(d.spaces.count, privacy: .public) Spaces. The app does not create Spaces for N above \(SpaceManager.maxSpaceCount, privacy: .public).")
             return nil
         }
-        let created = spaceManager.lastCreatedSpaceCount
-        log.info("\(what, privacy: .public): created \(created, privacy: .public) Space(s).")
-        guard n <= fresh.spaces.count else {
-            log.error("\(what, privacy: .public): the display has \(fresh.spaces.count, privacy: .public) Spaces after creation.")
+    }
+
+    /// Gives the spare desktop at the end of `d`: the empty last Space, or
+    /// one new desktop. Returns nil after a failure. A failure sets the menu
+    /// bar warning. A success does not touch the warning: only the later
+    /// switch or move does.
+    private func spareSpace(on d: DisplaySnapshot, what: String) async -> SpaceManager.SpareSpace? {
+        guard let spare = await spaceManager.spareSpace(on: d, creator: spaceCreator) else {
+            recordSwitch(false, what: what, reason: "The app could not create a Space.")
             return nil
         }
-        return fresh
+        if spare.created {
+            log.info("\(what, privacy: .public): created Space \(spare.id.description, privacy: .public) at position \(spare.index + 1, privacy: .public).")
+        } else {
+            log.info("\(what, privacy: .public): uses the empty last Space \(spare.id.description, privacy: .public) at position \(spare.index + 1, privacy: .public).")
+        }
+        return spare
     }
 
     private func moveToSpace(_ n: Int) {
@@ -808,16 +843,9 @@ public final class WMController {
             log.info("move-to-space \(n, privacy: .public): native fullscreen Space or window. Skipped.")
             return
         }
-        let all = d.spaces
-        guard n >= 1 else { return }
-        let missing = n > all.count
-        if missing {
-            guard canCreateSpaces(upTo: n) else {
-                log.info("move-to-space \(n, privacy: .public): the display has \(all.count, privacy: .public) Spaces.")
-                return
-            }
-        } else {
-            let target = all[n - 1]
+        guard let commandTarget = spaceTarget(n, on: d, what: "move-to-space \(n)") else { return }
+        if case .existing(let index) = commandTarget {
+            let target = d.spaces[index]
             guard target.isUser else {
                 log.info("move-to-space \(n, privacy: .public): Space \(n, privacy: .public) is a fullscreen app. Skipped.")
                 return
@@ -829,22 +857,30 @@ public final class WMController {
         let wasTiled = state.key(of: w.id) != nil
         let from = state.key(of: w.id) ?? SpaceKey(display: d.id, space: d.current.id)
         let follow = config.followOnMove
+        // The ticket belongs to the key press. A newer `space M` during the
+        // move or the creation wins over the follow switch.
+        let followTicket = follow ? spaceManager.reserveSwitch() : nil
 
         Task { [weak self] in
             guard let self else { return }
             var display = d
-            if missing {
-                guard let fresh = await self.createMissingSpaces(upTo: n, on: d, what: "move-to-space \(n)") else { return }
-                display = fresh
+            var position = n
+            if case .spare = commandTarget {
+                guard let spare = await self.spareSpace(on: d, what: "move-to-space \(n)") else { return }
+                display = spare.display
+                position = spare.index + 1
             }
-            // A created Space goes at the end of the list, so it is a normal desktop.
-            let target = display.spaces[n - 1]
+            let target = display.spaces[position - 1]
             guard target.isUser else {
-                self.log.info("move-to-space \(n, privacy: .public): Space \(n, privacy: .public) is a fullscreen app. Skipped.")
+                self.log.info("move-to-space \(n, privacy: .public): Space \(position, privacy: .public) is a fullscreen app. Skipped.")
+                return
+            }
+            guard target.id != display.current.id else {
+                self.log.info("move-to-space \(n, privacy: .public): the window is on the target Space already.")
                 return
             }
             let to = SpaceKey(display: d.id, space: target.id)
-            let ok = await self.spaceManager.move(w.id, toUserSpace: n, on: display)
+            let ok = await self.spaceManager.move(w.id, toUserSpace: position, on: display)
             self.recordSwitch(ok, what: "move-to-space \(n)")
             guard ok else { return }
             if self.tilingActive, wasTiled {
@@ -854,8 +890,8 @@ public final class WMController {
                 self.state.transfer(w.id, from: from, to: to)
             }
             if follow {
-                let switched = await self.spaceManager.switchTo(userSpace: n, on: display)
-                self.recordSpaceSwitch(switched, what: "space \(n)")
+                let switched = await self.spaceManager.switchTo(userSpace: position, on: display, ticket: followTicket)
+                self.recordSpaceSwitch(switched, what: "space \(position)")
                 if switched { w.focus() }
             } else if self.tilingActive, let next = self.state.trees[from]?.focused {
                 self.windowCache[next]?.focus()
