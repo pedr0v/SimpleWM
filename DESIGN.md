@@ -20,8 +20,9 @@ with `dlsym`.
 1. Spaces are native. The app never emulates workspaces.
 2. `N` in `space N` indexes all Spaces of the target display in `Spaces[]`
    order, which is the Mission Control order. A fullscreen Space counts.
-   `move-to-space N` only accepts a type-0 target. When the display has fewer
-   than N Spaces, the app creates desktops first (decision 10).
+   `move-to-space N` only accepts a type-0 target. When Space N does not
+   exist, the command goes to the spare desktop at the end of the display
+   (decision 10).
 3. The app never calls `SLSManagedDisplaySetCurrentSpace`. Yabai calls it
    only inside the Dock.
 4. Target display for `space N`: display of the focused window, then the
@@ -37,12 +38,21 @@ with `dlsym`.
 8. Every private symbol is optional. A missing symbol disables one feature.
    This includes `_AXUIElementGetWindow`: the app loads it with `dlsym`.
 9. The app refuses to tile while AeroSpace (`bobko.aerospace`) runs.
-10. `space N` and `move-to-space N` create the missing Spaces when
-    `createMissingSpaces` is true (default). The app presses the "+" button of
-    Mission Control through Accessibility. It does not call `SLSSpaceCreate`:
-    a process other than the Dock gets a Space that no display owns. The
-    creator is `SpaceCreator`. The sequence is in "Create Space".
+10. `space N` and `move-to-space N` with a missing Space N go to the spare
+    desktop when `createMissingSpaces` is true (default). The spare is the
+    last Space when it is an empty desktop. Else the app creates one desktop
+    at the end. One command creates at most one Space. The app presses the
+    "+" button of Mission Control through Accessibility. It does not call
+    `SLSSpaceCreate`: a process other than the Dock gets a Space that no
+    display owns. The creator is `SpaceCreator`. See "Missing Space N".
 11. The app installs an update only after the user agrees. See "Updates".
+12. The app finds the Mission Control tree by a probe of two processes, the
+    Dock and WindowManager. It does not read the OS version. macOS 27 moved
+    the tree from the Dock to WindowManager. See "Mission Control tree".
+13. `removeEmptySpaces` is true by default on macOS 27 and later, and
+    false before. The Dock of macOS 26 has no `AXRemoveDesktop`. The
+    cleanup keeps one empty spare desktop at the end of each display. See
+    "Remove empty Spaces".
 
 ## Updates
 
@@ -112,54 +122,171 @@ Verification polls `SLSManagedDisplayGetCurrentSpace` every 30 ms. The wait is
    enabled (`com.apple.symbolichotkeys` IDs 118..126). Verify.
 3. Failure: log and show `sWM!` in the menu bar.
 
-## Create Space
+## Missing Space N
 
-`space N` and `move-to-space N` need N Spaces on the target display. The
-count includes fullscreen Spaces (decision 2). When the display has fewer
-than N Spaces, the controller calls `SpaceManager.ensureSpaces(count:on:creator:)`
-inside its existing `Task`. Then it continues with the fresh snapshot.
-`switchTo(userSpace:on:)` and `move(_:toUserSpace:on:)` stay as they are:
-they never create a Space.
+`space N` and `move-to-space N` read the target display. The count includes
+fullscreen Spaces (decision 2). `SpaceTargetRules.target(n:count:createAllowed:maxCount:)`
+gives the target:
+
+- N is at most the count: Space N.
+- N is greater than the count, `createMissingSpaces` is true, and N is at
+  most 9 (`SpaceManager.maxSpaceCount`): the spare desktop.
+- Else nothing. The log tells the reason (`createMissingSpaces` is off, or N
+  is above 9).
+
+`SpaceManager.spareSpace(on:creator:)` gives the spare desktop. It holds the
+switch lock and reads the display again. Then
+`SpaceTargetRules.spare(spaces:isEmpty:maxCount:)` decides:
+
+- The last Space is a desktop (type 0) with no window: use it. It can be
+  the current Space. Then `space N` does nothing.
+- Else: create one desktop at the end with `SpaceCreator`.
+- The display has 9 Spaces and the last one has a window: nothing.
+
+N does not set the count of new Spaces. Examples on a display with 3 Spaces,
+each with a window:
+
+- `space 9` creates Space 4 and switches to it. The display has 4 Spaces.
+- `space 8` right after that switches to Space 4 (or stays on it). It
+  creates no Space, because Space 4 is an empty last desktop.
+- `move-to-space 9` with a focused window moves the window to the empty
+  Space 4. A second `move-to-space 9` then creates Space 5, because Space 4
+  now has a window.
+
+A second request that waits for the lock reads the display after the first
+request. It sees the new Space as the empty last desktop and reuses it. So
+two fast presses create one Space.
 
 Rules of the controller:
 
-- It creates Spaces only when `createMissingSpaces` is true and N is at most 9.
-- It logs `space N: created K Space(s)` after a success. A success does not
-  set the menu bar warning. Only a failed creation, switch, or move does.
+- It logs `space N: created Space S at position P` or `space N: uses the
+  empty last Space S at position P`. A success does not set the menu bar
+  warning. Only a failed creation, switch, or move does.
 - A failed creation stops the command. The window stays where it is.
+- `switchTo(userSpace:on:)` and `move(_:toUserSpace:on:)` never create a
+  Space. The controller calls them with the position of the spare.
+- The last key press wins. Each `space N`, `back-and-forth`, and `move-to-space N`
+  with `followOnMove` takes a ticket from `SpaceManager.reserveSwitch()` when
+  the user presses the key. The ticket goes to `switchTo(userSpace:on:ticket:)`.
+  A request with an old ticket does not switch. Example: `alt-9` creates
+  Space 4, and the user presses `alt-2` during the creation. The `alt-9`
+  request ends later, sees an old ticket, and does not switch to Space 4. The
+  display ends on Space 2. `SwitchTickets` holds the rule.
+- A press for the current Space during a creation or switch still goes to
+  the manager. The snapshot of the controller is old in that moment. The
+  manager reads the display again and keeps the display on that Space.
 
-Rules of `ensureSpaces`:
+## Mission Control tree
 
-- It caps N at 9. It creates at most 9 minus the current count of Spaces.
-- It creates one Space at a time and reads the display again after each one.
-- It holds the switch lock. A Space switch and a tiling refresh wait for it.
-- It returns the fresh snapshot, or nil when a creation fails.
+Only Mission Control can add or remove a desktop. The app reads its
+Accessibility tree while it is open. Live dump on macOS 27.2, Mission
+Control open, two displays:
+
+```
+WindowManager (com.apple.WindowManager), AXApplication
+  AXGroup id=mc.display AXDisplayID=1
+    AXButton id=<bundle id>.space.<n>          (one per window, AXPress)
+    AXGroup id=mc.spaces title="Spaces Bar"
+      AXList id=mc.spaces.list
+        AXButton title="Desktop 1" (AXPress, AXRemoveDesktop)
+        ...
+      AXButton id=mc.spaces.add desc="Add Desktop" (AXPress)
+  AXGroup id=mc.display AXDisplayID=4
+    ...
+```
+
+- macOS 27: the `mc.display` groups are children of the WindowManager
+  application. The Dock has only its item list. With Mission Control
+  closed, WindowManager has no `mc.display` child.
+- macOS 26 and earlier: the Dock application has a group `mc`. The
+  `mc.display` groups are its children.
+- Below `mc.display` both layouts are the same. Each list child is one
+  Space thumbnail in `Spaces[]` order. The only desktop of a display has
+  no `AXRemoveDesktop` action.
+
+`MissionControlTree` holds the matching rules as pure functions over the
+`AXTreeNode` protocol. Every rule matches identifiers, not text: titles and
+descriptions depend on the language. `MissionControl.root()` probes
+WindowManager and the Dock and asks the last host that matched first. The
+root is the group `mc`, or the application when it has a `mc.display`
+child. Mission Control is open when a root exists.
+
+While Mission Control is open, WindowManager puts layer-0 overlay windows
+("Material Label Window", "Window Highlight Overlay") on the Spaces.
+`SpaceManager.usedSpaces()` ignores windows of the Dock and WindowManager,
+so an empty Space stays empty.
+
+## Mission Control session
+
+`MissionControlSession` opens and closes Mission Control for the creator
+and the remover. Every path calls `close()`, the failure paths too.
+
+- `open(budget:)`: when the tree is visible, reuse it. Else toggle Mission
+  Control with `Mission Control.app` (`NSWorkspace`, `activates = false`)
+  and poll the root every 10 ms (2 s cap). The toggle does not depend on
+  the F3 shortcut. The wait for the app start has a cap of 2 s.
+- `close()` uses `closeAction(toggled:treeSeen:treeVisible:)`:
+  - The session did not toggle (Mission Control was open, or the toggle
+    failed): do nothing.
+  - The tree is visible: toggle, then poll until the tree is gone (1 s
+    cap). When it stays, post Escape and poll again (500 ms).
+  - The tree was visible and is gone (the user closed Mission Control): do
+    nothing.
+  - The tree never appeared: toggle once more and pause 500 ms. Each toggle
+    flips Mission Control, so two toggles restore the state before `open`.
+    This path closes Mission Control in an unknown tree layout.
+- After `close()`, wait 300 ms and until the display does not animate, so
+  a Space switch does not start inside the close animation.
+
+The Accessibility timeout for one request to a host is 0.5 s.
+
+## Create Space
 
 Steps of `SpaceCreator.createSpace(on:)`. Waits 3 to 6 share a budget of 3 s.
 
 1. Check Accessibility trust and read the Space list of the display.
-2. Open Mission Control with `Mission Control.app` (`NSWorkspace`,
-   `activates = false`). The focus stays. It does not depend on the F3
-   shortcut. When the Dock already shows Mission Control, reuse it and leave
-   it open.
-3. Poll every 10 ms (2 s cap) for the Dock AX child with `AXIdentifier` `mc`.
-   It appears after 75 to 120 ms.
-4. In the `mc.display` child whose `AXDisplayID` equals the `CGDirectDisplayID`
-   of the display, find the button `mc.spaces.add`. Match on the identifier.
-   The description text depends on the language ("add desktop",
-   "adicionar mesa"). With shared Spaces, any display group works.
-5. Send `AXPress` to the button. It returns in 7 to 26 ms.
+2. Open a `MissionControlSession`.
+3. Wait for the root. On macOS 27.2 it appears 60 to 90 ms after the toggle.
+4. In the `mc.display` group whose `AXDisplayID` equals the `CGDirectDisplayID`
+   of the display, find the button `mc.spaces.add`. With shared Spaces, any
+   display group works.
+5. Send `AXPress` to the button.
 6. Poll `SLSCopyManagedDisplaySpaces` every 50 ms (2 s cap) until the display
-   lists a new type-0 Space. It appears 9 to 27 ms after the press. The Dock
-   appends it at the end of `Spaces[]`.
-7. Close Mission Control with the same toggle, only when this call opened it.
-   Poll until the `mc` group is gone (1 s cap). When it stays, post Escape.
-   Then wait 300 ms and until the display does not animate, so a Space switch
-   does not start inside the close animation.
+   lists a new type-0 Space. On macOS 27.2 it appears about 60 ms after the
+   press, at the end of `Spaces[]`.
+7. Close the session.
 
-The current Space of the display and the frontmost window do not change. One
-creation takes about 450 to 600 ms. A timeout or an AX error returns nil and
-logs the reason in the `spaces` category.
+The current Space of the display and the frontmost window do not change.
+One creation takes about 450 to 550 ms on macOS 27.2. A timeout or an AX
+error returns nil and logs the reason in the `spaces` category.
+
+## Remove empty Spaces
+
+`removeEmptySpaces` is true by default on macOS 27 and later
+(`SpaceRemover.systemSupportsRemoval`). The controller schedules a pass
+1.5 s after the last refresh. The pass waits while a mouse button is down,
+while a Space transition runs, while the remover runs, and while Mission
+Control is open.
+
+`SpaceTargetRules.removableEmptySpaces(spaces:current:isEmpty:)` picks the
+candidates of a display. The first Space, the current Space, the last
+Space, a fullscreen Space, and a Space with a window stay. So at most one
+empty spare desktop stays at the end of each display.
+
+Steps of `SpaceRemover.removeSpaces(_:on:isEmpty:)` (budget 4 s):
+
+1. Open a `MissionControlSession` and find `mc.spaces.list` of the display.
+2. For each candidate, highest index first: check the rules again (the
+   window check too), wait until the list has as many thumbnails as
+   SkyLight has Spaces, run `AXRemoveDesktop` on the thumbnail at the
+   index, and poll SkyLight until the Space is gone.
+3. Close the session.
+
+A skipped candidate (it got a window or became current) is not a failure.
+A failure (no tree, no list, count mismatch, AX error, timeout) blocks the
+same candidate set. After 3 failures the cleanup stops until a restart. One
+pass handles one display. On macOS 27.2 one pass with two removals takes
+about 600 ms.
 
 ## Move window to Space N
 

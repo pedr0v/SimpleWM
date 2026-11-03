@@ -1,5 +1,6 @@
 import Foundation
 import LayoutEngine
+import MacOSBridge
 
 /// User config at `~/.config/simplewm/config.json`.
 ///
@@ -18,14 +19,17 @@ public struct Config: Codable, Equatable {
     /// `horizontal`, `vertical`, or `auto` (longer side of the work area).
     public var rootOrientation: String = "auto"
     public var followOnMove: Bool = false
-    /// When true, `space N` and `move-to-space N` create desktops on the
-    /// display until it has N Spaces. Creation opens Mission Control for a moment.
+    /// When true, `space N` and `move-to-space N` with a missing Space N go
+    /// to the spare desktop at the end of the display: the last Space when it
+    /// is an empty desktop, else one new desktop. One command creates at
+    /// most one Space. Creation opens Mission Control for a moment.
     public var createMissingSpaces: Bool = true
     /// When true, the app removes an empty desktop that is not the first,
     /// not the current, and not the last one of its display. One spare
-    /// empty desktop stays at the end, as in Mission Control.
-    /// Off by default: the Mission Control action is experimental.
-    public var removeEmptySpaces: Bool = false
+    /// empty desktop stays at the end, as in Mission Control. Removal opens
+    /// Mission Control for a moment. The default is true on macOS 27 and
+    /// later, and false before: see `SpaceRemover.systemSupportsRemoval`.
+    public var removeEmptySpaces: Bool = SpaceRemover.systemSupportsRemoval
     public var spaceSwitch: SpaceSwitch = SpaceSwitch()
     public var floatingApps: [String] = ["com.apple.systempreferences"]
     /// When true, a window without a usable zoom button floats. Settings

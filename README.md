@@ -119,18 +119,28 @@ i3. The new size stays after the mouse up. `alt-shift-minus` and
 `N` follows the Mission Control order of the focused display. A fullscreen
 app counts as one Space. `move-to-space N` only targets a normal desktop.
 
-If Space N does not exist, the app creates desktops up to N on that display
-and then switches to Space N (`space N`) or moves the window there
-(`move-to-space N`). A workspace appears on demand, as in i3. The app
-creates at most 9 Spaces on a display. Set `createMissingSpaces` to `false`
-to turn this off. Then a key for a missing Space does nothing.
+If Space N does not exist, the key goes to the spare desktop at the end of
+that display. `space N` switches to it. `move-to-space N` moves the window
+to it. The spare is the last desktop when it has no window. Else the app
+creates one new desktop at the end. One key press creates at most one
+desktop, so the number N does not matter. Examples with 3 desktops that
+have windows:
 
-Experimental: with `removeEmptySpaces` set to `true`, the app removes a
-desktop that has no window about 1.5 s later. The first desktop, the
-current desktop, a fullscreen app, and the last desktop of a display always
-stay. So one empty desktop remains at the end, as in Mission Control. A
-window on "All Desktops" keeps no desktop. The option is off by default.
-After 3 failed passes the app stops cleanup until a restart.
+- `alt-9` creates desktop 4 and switches to it.
+- `alt-8` right after that goes to desktop 4 again. It creates nothing,
+  because desktop 4 is empty.
+- `alt-1` goes back to desktop 1.
+
+A workspace appears on demand, as in i3. A key for N above 9 does nothing
+when Space N does not exist. Set `createMissingSpaces` to `false` to turn
+this off. Then a key for a missing Space does nothing.
+
+The app also removes a desktop that has no window, about 1.5 s later
+(`removeEmptySpaces`, on by default on macOS 27 and later). The first desktop, the current
+desktop, a fullscreen app, and the last desktop of a display always stay.
+So at most one empty desktop remains at the end, as in Mission Control. A
+window on "All Desktops" keeps no desktop. After 3 failed passes the app
+stops cleanup until a restart.
 
 Key codes are physical. The keyboard layout (for example ABNT2) does not
 change the bindings.
@@ -156,7 +166,7 @@ Config" to apply it.
     "alt-shift-equal" : "resize 0.05"
   },
   "createMissingSpaces" : true,
-  "removeEmptySpaces" : false,
+  "removeEmptySpaces" : true,
   "floatingApps" : [
     "com.apple.systempreferences"
   ],
@@ -186,11 +196,15 @@ Keys:
     `resize X`, `toggle-float`, `focus-monitor D`, `move-to-monitor D`,
     `back-and-forth` (alias `space back`).
 - `createMissingSpaces`: when `true` (default), `space N` and
-  `move-to-space N` create desktops on the focused display until it has N
-  Spaces. When `false`, a key for a missing Space does nothing.
-- `removeEmptySpaces`: experimental, `false` by default. When `true`, the
-  app removes an empty desktop that is not the first, the current, or the
-  last one of its display. Removal opens Mission Control for a moment.
+  `move-to-space N` with a missing Space N go to the spare desktop at the
+  end of the display: the empty last desktop, or one new desktop. When
+  `false`, a key for a missing Space does nothing.
+- `removeEmptySpaces`: when `true`, the app removes an empty desktop that
+  is not the first, the current, or the last one of its display. Removal
+  opens Mission Control for a moment. The default is `true` on macOS 27
+  and later. On macOS 26 the default is `false`, because the Dock there
+  has no action to remove a desktop. Set it to `false` to keep every
+  desktop.
 - `floatingApps`: bundle IDs that the app never tiles.
 - `floatWindowsWithoutZoom`: when `true` (default), a window without an
   enabled zoom button floats. System Settings and most utility panels have
@@ -217,13 +231,14 @@ good config, and the app logs the error. A bad binding is logged and skipped.
   app runs the Accessibility action `AXRemoveDesktop` on the thumbnail. When
   a desktop in the middle goes away, the desktops after it shift down by
   one number.
-- Creating a Space opens Mission Control for a moment (about half a second
-  for each Space). macOS has no public API for this. The app presses the
-  "+" button of Mission Control through Accessibility. It needs the
-  Accessibility grant. The new Space goes at the end of the list. The
-  current Space and the focus stay. A macOS update can change the Mission
-  Control layout. Then creation fails, the log shows the reason, and the
-  menu bar shows `sWM!`.
+- Creating a Space opens Mission Control for about half a second. macOS has
+  no public API for this. The app presses the "+" button of Mission Control
+  through Accessibility. It needs the Accessibility grant. The new Space
+  goes at the end of the list. The current Space and the focus stay.
+- The app finds Mission Control in the Dock (macOS 26 and earlier) or in
+  WindowManager (macOS 27). A macOS update can change the Mission Control
+  layout again. Then creation and removal fail, the app closes Mission
+  Control, the log shows the reason, and the menu bar shows `sWM!`.
 - The app does not touch native fullscreen windows or their Spaces. A
   display that shows a fullscreen Space gets no tiling. `space N` still works.
 - macOS lists windows only on visible Spaces. The app updates a tree only
@@ -283,9 +298,20 @@ SIMPLEWM_DRY_RUN=1 .build/debug/SimpleWM
   - "Last Space switch, creation, or move failed": read the log. Turn on "Switch to
     Desktop N" shortcuts to enable the `Ctrl+N` fallback.
 - **`space N` does not create a Space.** Check that `createMissingSpaces` is
-  not `false`, that Accessibility is granted, and that N is at most 9. Read
-  the log of the `spaces` category: it names the step that failed (Mission
-  Control did not open, no add button, no new Space).
+  not `false`, that Accessibility is granted, and that N is at most 9. When
+  the last desktop has no window, the app uses it and creates nothing: this
+  is the normal behavior. Read the log of the `spaces` category: it names
+  the step that failed (the Mission Control tree did not appear, no add
+  button, no new Space).
+- **Mission Control stays open or the screen seems stuck after `space N`.**
+  Press Escape. Then read the log of the `spaces` category. "the Mission
+  Control tree did not appear" lists the top-level children of the Dock and
+  WindowManager: the Mission Control layout of this macOS version is new.
+  Versions before 0.1.9 looked for the tree only in the Dock. On macOS 27
+  they left Mission Control open. Update the app.
+- **Mission Control flashes when a desktop becomes empty.** This is the
+  cleanup of empty desktops. Set `removeEmptySpaces` to `false` to keep
+  every desktop.
 - **`space N` does not switch, log shows "Event posting allowed: false".**
   The app does not have the event-posting grant. WindowServer then logs
   "Sender is prohibited from synthesizing events". macOS gives this grant

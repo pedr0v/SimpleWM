@@ -240,8 +240,6 @@ public final class SpaceManager {
 
     /// Outcome of the last `switchTo(userSpace:on:)` call.
     public private(set) var lastSwitchOutcome: SpaceSwitchOutcome?
-    /// Count of Spaces that the last `ensureSpaces` call created.
-    public private(set) var lastCreatedSpaceCount: Int = 0
     /// Name of the switch strategy that verified last. The manager tries it first.
     public private(set) var cachedSwitchStrategy: String?
     /// Name of the move strategy that verified last. The manager tries it first.
@@ -249,7 +247,7 @@ public final class SpaceManager {
 
     private let log = Logger(subsystem: "com.simplewm.app", category: "spaces")
     private var switchBusy = false
-    private var switchGeneration = 0
+    private var switchTickets = SwitchTickets()
 
     public init(skyLight: SkyLight = .shared,
                 switchStrategies: [SpaceSwitchStrategy] = [],
@@ -392,42 +390,33 @@ public final class SpaceManager {
     /// Spaces that hold at least one window. Hidden and minimized windows
     /// count. A window on several Spaces (sticky, "All Desktops") counts for
     /// none of them. Only layer-0 windows count: menu bars, the Dock, and
-    /// desktop elements never keep a Space.
+    /// desktop elements never keep a Space. Windows of the Mission Control
+    /// hosts (Dock, WindowManager) never keep a Space: Mission Control puts
+    /// layer-0 overlays on each Space while it is open.
     public func usedSpaces() -> Set<SpaceID> {
         var used = Set<SpaceID>()
-        for w in WindowEnumerator.allLayerZeroIDs() {
+        for w in WindowEnumerator.allLayerZeroIDs(excludingOwners: MissionControl.hostPIDs()) {
             let spaces = SpaceReader.spaces(ofWindow: w, skyLight)
             if spaces.count == 1 { used.insert(spaces[0]) }
         }
         return used
     }
 
-    /// Empty user Spaces of `display` that the app may remove.
-    ///
-    /// Rules:
-    /// - The first Space of the display stays.
-    /// - The current Space stays.
-    /// - A non-user Space (fullscreen app) stays.
-    /// - The last Space of the display stays, so one spare desktop remains.
-    /// - A Space with a window stays (`usedSpaces`).
+    /// Empty user Spaces of `display` that the app may remove. See
+    /// `SpaceTargetRules.removableEmptySpaces(spaces:current:isEmpty:)` for
+    /// the rules. A Space with a window (`usedSpaces`) stays.
     public func emptySpaceCandidates(on display: DisplaySnapshot) -> [SpaceInfo] {
         let used = usedSpaces()
-        let spaces = display.spaces
-        guard spaces.count > 1 else { return [] }
-        var out: [SpaceInfo] = []
-        for (i, s) in spaces.enumerated() {
-            guard i > 0, i < spaces.count - 1, s.isUser, s.id != display.current.id,
-                  !used.contains(s.id) else { continue }
-            out.append(s)
+        return SpaceTargetRules.removableEmptySpaces(spaces: display.spaces, current: display.current.id) {
+            !used.contains($0)
         }
-        return out
     }
 
     /// Removes `ids` from `display` with `remover`. Holds the switch lock,
     /// so a Space switch waits while Mission Control is open. Returns the
-    /// count of removed Spaces, or nil when the lock stays busy.
-    public func removeSpaces(_ ids: [SpaceID], on display: DisplaySnapshot, remover: SpaceRemover) async -> Int? {
-        guard !ids.isEmpty else { return 0 }
+    /// result of the remover, or nil when the lock stays busy.
+    public func removeSpaces(_ ids: [SpaceID], on display: DisplaySnapshot, remover: SpaceRemover) async -> SpaceRemover.Result? {
+        guard !ids.isEmpty else { return SpaceRemover.Result() }
         let waitUntil = Date().addingTimeInterval(8)
         while switchBusy, Date() < waitUntil {
             try? await Task.sleep(nanoseconds: 20_000_000)
@@ -438,32 +427,45 @@ public final class SpaceManager {
         }
         switchBusy = true
         defer { switchBusy = false }
-        return await remover.removeSpaces(ids, on: display)
+        return await remover.removeSpaces(ids, on: display) { !self.usedSpaces().contains($0) }
+    }
+
+    /// Takes a ticket for a later `switchTo(userSpace:on:ticket:)`. A newer
+    /// ticket replaces every older ticket. The caller takes the ticket when
+    /// the user presses the key, before a slow step such as `spareSpace`. So
+    /// the last key press wins.
+    public func reserveSwitch() -> Int {
+        switchTickets.issue()
     }
 
     /// Switches `display` to its Nth user Space (1-based). Does nothing when
-    /// N exceeds the count. Never creates a Space: call `ensureSpaces` first.
+    /// N exceeds the count. Never creates a Space: call `spareSpace` first.
+    ///
+    /// `ticket` comes from `reserveSwitch()`. Without it, the call takes a
+    /// new ticket now. A request with an old ticket does not switch. It does
+    /// not wait for the lock either.
     ///
     /// Returns true when the target Space is current after the call. A newer
-    /// request replaces an older request that still waits; the older request
-    /// returns false with outcome `.superseded`. Read `lastSwitchOutcome`
-    /// to tell a no-op from a failure.
-    public func switchTo(userSpace n: Int, on display: DisplaySnapshot) async -> Bool {
-        switchGeneration += 1
-        let generation = switchGeneration
-        while switchBusy {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-            if generation != switchGeneration {
+    /// request replaces an older request, also when the older request does
+    /// not wait; the older request returns false with outcome `.superseded`.
+    /// Read `lastSwitchOutcome` to tell a no-op from a failure.
+    public func switchTo(userSpace n: Int, on display: DisplaySnapshot, ticket: Int? = nil) async -> Bool {
+        let ticket = ticket ?? reserveSwitch()
+        while true {
+            guard switchTickets.isLatest(ticket) else {
                 log.debug("Switch to Space \(n) superseded")
                 lastSwitchOutcome = .superseded
                 return false
             }
+            guard switchBusy else { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
         switchBusy = true
         defer { switchBusy = false }
 
         let outcome = await performSwitch(userSpace: n, on: display)
         lastSwitchOutcome = outcome
+        log.debug("Switch to Space \(n) on \(display.id.uuid, privacy: .public): \(String(describing: outcome), privacy: .public)")
         switch outcome {
         case .switched:
             onSpaceChange?()
@@ -475,63 +477,76 @@ public final class SpaceManager {
         }
     }
 
-    /// Most Spaces per display that `ensureSpaces` creates. It matches the
-    /// largest N of `space N`.
+    /// Most Spaces per display. `spareSpace` does not create a Space on a
+    /// display that has this count. It matches the largest N of `space N`.
     public static let maxSpaceCount = 9
 
-    /// Creates desktops on `display` until it lists at least `n` Spaces.
+    /// Spare desktop at the end of a display, from `spareSpace(on:creator:)`.
+    public struct SpareSpace: Equatable, Sendable {
+        /// Fresh snapshot of the display.
+        public let display: DisplaySnapshot
+        /// Index of the spare in `display.spaces`.
+        public let index: Int
+        public let id: SpaceID
+        /// True when the call created the Space. False when it reused the
+        /// empty last Space.
+        public let created: Bool
+    }
+
+    /// Gives one empty desktop at the end of `display` for `space N` or
+    /// `move-to-space N` with a missing N.
     ///
-    /// The cap for `n` is `maxSpaceCount`. The function creates at most
-    /// `maxSpaceCount` minus the current count of Spaces, one by one, and
-    /// reads the display again after each one. It does nothing when the
-    /// display has enough Spaces. It does not switch Spaces and does not
-    /// move windows: `switchTo(userSpace:on:)` and `move(_:toUserSpace:on:)`
-    /// stay as they are. The caller runs them with the fresh snapshot.
+    /// The function reads the display again. When the last Space is an empty
+    /// desktop, it returns that Space. Else it creates one desktop with
+    /// `creator`. It never creates more than one Space. See
+    /// `SpaceTargetRules.spare(spaces:isEmpty:maxCount:)`. It does not
+    /// switch Spaces and does not move windows. The caller runs
+    /// `switchTo(userSpace:on:)` or `move(_:toUserSpace:on:)` with the
+    /// fresh snapshot.
     ///
     /// The function holds the switch lock while it runs. A Space switch waits
     /// for it. A tiling refresh waits for it too, because Mission Control is
-    /// open for a moment.
+    /// open for a moment. A second request that waits for the lock sees the
+    /// Space of the first request as an empty last Space and reuses it.
     ///
-    /// Returns the fresh snapshot, or nil when a creation fails.
-    public func ensureSpaces(count n: Int, on display: DisplaySnapshot, creator: SpaceCreator) async -> DisplaySnapshot? {
-        let wanted = min(n, Self.maxSpaceCount)
+    /// Returns nil when the creation fails or when the display is full.
+    public func spareSpace(on display: DisplaySnapshot, creator: SpaceCreator) async -> SpareSpace? {
         // Wait for a running switch or creation. A stuck flag cannot block forever.
         let waitUntil = Date().addingTimeInterval(8)
         while switchBusy, Date() < waitUntil {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         guard !switchBusy else {
-            log.error("Create Spaces: the switch lock stays busy. Request dropped.")
+            log.error("Spare Space: the switch lock stays busy. Request dropped.")
             return nil
         }
         switchBusy = true
         defer { switchBusy = false }
 
-        lastCreatedSpaceCount = 0
-        var fresh = displays().first { $0.id == display.id } ?? display
-        let budget = max(0, Self.maxSpaceCount - fresh.spaces.count)
-        var created = 0
-        while fresh.spaces.count < wanted {
-            guard created < budget else {
-                log.error("Create Spaces: the cap of \(budget, privacy: .public) new Spaces is reached.")
-                return nil
-            }
-            guard await creator.createSpace(on: fresh) != nil else {
-                log.error("Create Spaces: creation \(created + 1, privacy: .public) failed on \(fresh.id.uuid, privacy: .public).")
-                return nil
-            }
-            created += 1
-            lastCreatedSpaceCount = created
-            guard let next = displays().first(where: { $0.id == display.id }) else {
-                log.error("Create Spaces: display \(display.id.uuid, privacy: .public) is gone after creation.")
-                return nil
-            }
-            fresh = next
+        let fresh = displays().first { $0.id == display.id } ?? display
+        let used = usedSpaces()
+        switch SpaceTargetRules.spare(spaces: fresh.spaces, isEmpty: { !used.contains($0) },
+                                      maxCount: Self.maxSpaceCount) {
+        case .reuse(let index):
+            log.info("Spare Space: the last Space \(fresh.spaces[index].id.description, privacy: .public) of \(fresh.id.uuid, privacy: .public) is empty. No new Space.")
+            return SpareSpace(display: fresh, index: index, id: fresh.spaces[index].id, created: false)
+        case .full:
+            log.info("Spare Space: \(fresh.id.uuid, privacy: .public) has \(fresh.spaces.count, privacy: .public) Spaces, the cap is \(Self.maxSpaceCount, privacy: .public). No new Space.")
+            return nil
+        case .create:
+            break
         }
-        if created > 0 {
-            log.info("Created \(created, privacy: .public) Space(s) on \(fresh.id.uuid, privacy: .public). The display has \(fresh.spaces.count, privacy: .public).")
+        guard let id = await creator.createSpace(on: fresh) else {
+            log.error("Spare Space: creation failed on \(fresh.id.uuid, privacy: .public).")
+            return nil
         }
-        return fresh
+        guard let next = displays().first(where: { $0.id == display.id }),
+              let index = next.spaces.firstIndex(where: { $0.id == id }) else {
+            log.error("Spare Space: display \(display.id.uuid, privacy: .public) does not list Space \(id.description, privacy: .public) after creation.")
+            return nil
+        }
+        log.info("Created Space \(id.description, privacy: .public) on \(next.id.uuid, privacy: .public). The display has \(next.spaces.count, privacy: .public).")
+        return SpareSpace(display: next, index: index, id: id, created: true)
     }
 
     private func performSwitch(userSpace n: Int, on display: DisplaySnapshot) async -> SpaceSwitchOutcome {
