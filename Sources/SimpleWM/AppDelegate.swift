@@ -76,13 +76,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Startup diagnostics
 
-    /// Logs the displays, the Spaces, and the Accessibility grant.
+    /// Logs the displays, the Spaces, the Accessibility grant, the event-posting
+    /// grant, and the Dock swipe mode.
     /// This function only reads state. It never switches a Space.
     private func logStartupDiagnostics() {
         let version = ProcessInfo.processInfo.operatingSystemVersionString
         log.notice("SimpleWM starts. pid \(ProcessInfo.processInfo.processIdentifier, privacy: .public), macOS \(version, privacy: .public)")
         let trusted = Permissions.isAccessibilityTrusted()
         log.notice("Accessibility granted: \(trusted, privacy: .public)")
+        // Event posting needs its own grant. Without it, WindowServer drops the Dock swipes.
+        log.notice("Event posting allowed: \(CGPreflightPostEventAccess(), privacy: .public)")
+        let swipeMode = DockSwipeEvent.requiresPayload ? "payload (macOS 27+)" : "legacy"
+        log.notice("Dock swipe mode: \(swipeMode, privacy: .public)")
         log.notice("Displays have separate Spaces: \(self.controller.displayManager.screensHaveSeparateSpaces, privacy: .public)")
 
         let screens = controller.displayManager.displays()

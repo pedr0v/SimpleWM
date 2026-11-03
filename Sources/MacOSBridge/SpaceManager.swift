@@ -620,11 +620,22 @@ public final class SpaceManager {
 
 // MARK: - Switch strategies
 
-/// Synthetic Dock swipe (yabai v7.1.19 method). Primary strategy.
+/// Synthetic Dock swipe. Primary strategy.
 /// It warps the cursor to the target display, posts one swipe per step,
 /// and polls `SLSManagedDisplayGetCurrentSpace` (30 ms). The wait grows with
 /// the step count: 300 ms plus 250 ms per step, at least 600 ms.
 /// It repeats at most two rounds, then restores the cursor.
+///
+/// The swipe has two forms:
+/// - macOS 27 and later (`DockSwipeEvent.requiresPayload`): three events per
+///   step (began, changed, ended). Each event carries an IOHID payload in
+///   field 4205. The base sign comes from the direction and the Natural
+///   scrolling setting. The strategy builds all events first. When one event
+///   fails, it posts nothing.
+/// - macOS 26 and earlier (yabai v7.1.19 method): two events per step (began,
+///   ended). A forward move has the base sign +1.
+///
+/// The posted sign is the base sign times `directionFactor`.
 ///
 /// A burst of swipes reports every hop as the current Space. Round 2 starts
 /// only after the display stops: not animating, and the same Space for three
@@ -638,7 +649,8 @@ public final class GestureSwitch: SpaceSwitchStrategy {
     /// the next round warps the cursor anyway.
     public var warpCursor: Bool
     /// Sign multiplier for swipe progress. The strategy flips it when a
-    /// round moves the display the wrong way.
+    /// round moves the display the wrong way. The posted sign is the base
+    /// sign of the swipe form times this factor.
     public private(set) var directionFactor: Double = 1
 
     private let log = Logger(subsystem: "com.simplewm.app", category: "gesture")
@@ -700,6 +712,11 @@ public final class GestureSwitch: SpaceSwitchStrategy {
             }
         }
 
+        // macOS 27 form: read Natural scrolling once per request. Nil selects
+        // the legacy form.
+        let natural: Bool? = DockSwipeEvent.requiresPayload ? DockSwipeEvent.naturalScrolling() : nil
+        if let natural { resetDirectionIfContextChanged(naturalScrolling: natural) }
+
         var lastRoundMoved = true
         for round in 1...Self.maxRounds {
             // yabai refuses to switch while the display animates. Wait instead.
@@ -714,7 +731,11 @@ public final class GestureSwitch: SpaceSwitchStrategy {
                 return false
             }
             let delta = targetIndex - currentIndex
-            let sign: Double = delta > 0 ? 1 : -1
+            let forward = delta > 0
+            // Base sign of the swipe form. The legacy form uses +1 for a
+            // forward move.
+            let sign: Double = natural.map { DockSwipeEvent.baseSign(forward: forward, naturalScrolling: $0) }
+                ?? (forward ? 1 : -1)
             let steps = abs(delta)
 
             // Without a warp the Dock may act on the display under the real
@@ -723,7 +744,8 @@ public final class GestureSwitch: SpaceSwitchStrategy {
                 if !warpCursor { log.notice("Gesture: no move without a warp. Warping the cursor (round \(round)).") }
                 warpIfNeeded()
             }
-            postSwipes(steps: steps, sign: sign * directionFactor, at: display)
+            // A sequence that cannot be built fails the strategy at once.
+            guard postSwipes(steps: steps, sign: sign * directionFactor, at: display) else { return false }
 
             if await SpaceReader.waitForCurrentSpace(target, on: display.id,
                                                      timeoutMs: Self.verifyTimeoutMs(steps: steps)) {
@@ -744,9 +766,60 @@ public final class GestureSwitch: SpaceSwitchStrategy {
         return false
     }
 
-    /// Posts `steps` swipe pairs (began, ended) to the session event tap.
-    private func postSwipes(steps: Int, sign: Double, at display: DisplaySnapshot) {
-        guard steps > 0, let event = CGEvent(source: nil) else { return }
+    /// Posts `steps` swipes to the session event tap.
+    /// On macOS 27 and later each step is three events with a field 4205
+    /// payload (see `DockSwipeEvent`). On macOS 26 and earlier each step is
+    /// a pair of events (began, ended).
+    /// Returns false when the events cannot be built. Then nothing is posted.
+    private func postSwipes(steps: Int, sign: Double, at display: DisplaySnapshot) -> Bool {
+        guard steps > 0 else { return true }
+        if DockSwipeEvent.requiresPayload {
+            return postPayloadSwipes(steps: steps, sign: sign)
+        }
+        return postLegacySwipes(steps: steps, sign: sign, at: display)
+    }
+
+    /// macOS 27 form. Builds the full sequence first. When one event fails,
+    /// it posts nothing: a truncated sequence leaves the Dock in the middle
+    /// of a swipe. Then it posts all events back to back. The events keep
+    /// the real cursor location, as in the tested form. The cursor warp
+    /// selects the display.
+    private func postPayloadSwipes(steps: Int, sign: Double) -> Bool {
+        guard let events = DockSwipeEvent.sequence(steps: steps, sign: sign) else {
+            log.error("Gesture: cannot build the Dock swipe sequence (\(steps) steps). Posted nothing.")
+            return false
+        }
+        for event in events {
+            event.post(tap: .cgSessionEventTap)
+        }
+        return true
+    }
+
+    /// Dock process and Natural scrolling value of the last macOS 27 request.
+    private struct SignContext: Equatable {
+        let dockPID: pid_t
+        let naturalScrolling: Bool
+    }
+    private var signContext: SignContext?
+
+    /// Resets `directionFactor` to 1 when the Dock restarted or Natural
+    /// scrolling changed since the last request. The Dock reads Natural
+    /// scrolling at launch, so a learned flip belongs to one Dock process
+    /// and one setting value.
+    private func resetDirectionIfContextChanged(naturalScrolling: Bool) {
+        let dockPID = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier ?? 0
+        let context = SignContext(dockPID: dockPID, naturalScrolling: naturalScrolling)
+        if let old = signContext, old != context, directionFactor != 1 {
+            directionFactor = 1
+            log.notice("Gesture: Dock or Natural scrolling changed. Swipe direction reset.")
+        }
+        signContext = context
+    }
+
+    /// macOS 26 form (yabai v7.1.19): `steps` swipe pairs (began, ended).
+    private func postLegacySwipes(steps: Int, sign: Double, at display: DisplaySnapshot) -> Bool {
+        guard let event = CGEvent(source: nil) else { return false }
         func setInt(_ field: UInt32, _ value: Int64) {
             guard let f = CGEventField(rawValue: field) else { return }
             event.setIntegerValueField(f, value: value)
@@ -772,6 +845,7 @@ public final class GestureSwitch: SpaceSwitchStrategy {
             setInt(Self.fieldGesturePhase, Self.phaseEnded)
             event.post(tap: .cgSessionEventTap)
         }
+        return true
     }
 }
 
